@@ -1,5 +1,6 @@
 import numpy as np
 import cv2
+from src.tracker import PATTERN_DX, PATTERN_DY
 
 class Keyframe:
     def __init__(self, kf_id, img, depth, T_W_C, K, a=0.0, b=0.0, mask=None, num_features=2000):
@@ -33,15 +34,17 @@ class Keyframe:
             u = u[valid]
             v = v[valid]
             z = z[valid]
+            self.pixels = np.stack([u, v], axis=1).astype(np.float64)
+            self.feature_ids = np.array(
+                [kf_id * num_features + i for i in range(len(u))],
+                dtype=int,
+            )
             
             # 3. Store RAW Intensities using a 5-pixel DSO-style pattern
             # Pattern: Center, Right, Left, Down, Up
-            dx = np.array([0, 1, -1, 0, 0])
-            dy = np.array([0, 0, 0, 1, -1])
-            
-            self.intensities = np.zeros((len(u), 5), dtype=np.float32)
-            for i in range(5):
-                self.intensities[:, i] = img[v + dy[i], u + dx[i]].astype(np.float32)
+            self.intensities = np.zeros((len(u), len(PATTERN_DX)), dtype=np.float32)
+            for i in range(len(PATTERN_DX)):
+                self.intensities[:, i] = img[v + PATTERN_DY[i], u + PATTERN_DX[i]].astype(np.float32)
             
             # 3. Back-project to the Camera Frame
             cx, cy = K[0, 2], K[1, 2]
@@ -59,6 +62,8 @@ class Keyframe:
             self.pts_3d_w = np.empty((0, 3), dtype=np.float64)
             self.pts_3d_c = np.empty((0, 3), dtype=np.float64)
             self.intensities = np.empty((0, 5), dtype=np.float32)
+            self.pixels = np.empty((0, 2), dtype=np.float64)
+            self.feature_ids = np.empty((0,), dtype=int)
             
         self.img = img.copy()
 
@@ -138,6 +143,7 @@ class Map:
                 valid = Z > 0.01
                 
                 if np.any(valid):
+                    valid_indices = np.where(valid)[0]
                     u = (self.K[0,0] * pts_c[valid, 0] / Z[valid] + self.K[0,2])
                     v = (self.K[1,1] * pts_c[valid, 1] / Z[valid] + self.K[1,2])
                     
@@ -145,11 +151,13 @@ class Map:
                     in_bounds = (u >= 0) & (u < w) & (v >= 0) & (v < h)
                     
                     rescue_mask = np.zeros_like(valid, dtype=bool)
-                    rescue_mask[np.where(valid)[0][in_bounds]] = True
+                    rescue_mask[valid_indices[in_bounds]] = True
                     
                     if np.sum(rescue_mask) > 0:
+                        rescued_visible = rescue_mask[valid_indices]
                         latest_kf.pts_3d_w = np.vstack([latest_kf.pts_3d_w, dropped_kf.pts_3d_w[rescue_mask]])
                         latest_kf.pts_3d_c = np.vstack([latest_kf.pts_3d_c, pts_c[rescue_mask]])
+                        latest_kf.feature_ids = np.concatenate([latest_kf.feature_ids, dropped_kf.feature_ids[rescue_mask]])
                         
                         # Apply relative affine mapping to transfer RAW intensities into the new host's exposure space!
                         # I_latest = exp(a_latest - a_dropped) * I_dropped + (b_latest - b_dropped)
@@ -158,6 +166,8 @@ class Map:
                         transferred_ints = exp_diff * dropped_kf.intensities[rescue_mask] + bias_diff
                         
                         latest_kf.intensities = np.concatenate([latest_kf.intensities, transferred_ints])
+                        projected_pixels = np.stack([u[rescued_visible], v[rescued_visible]], axis=1)
+                        latest_kf.pixels = np.vstack([latest_kf.pixels, projected_pixels])
                 
                 self.keyframes.pop(drop_idx)
             
@@ -175,3 +185,57 @@ class Map:
         kf_ids = np.concatenate([np.full(len(kf.intensities), kf.kf_id, dtype=int) for kf in self.keyframes])
         
         return pts, ints, a_vals, b_vals, kf_ids
+
+    def get_window_feature_ids(self):
+        if not self.keyframes:
+            return np.empty((0,), dtype=int)
+        return np.concatenate([kf.feature_ids for kf in self.keyframes])
+
+    def point_cloud(self, max_points=None):
+        pts, intensities, _, _, kf_ids = self.get_window_points()
+        if len(pts) == 0:
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0,), dtype=np.float32),
+                np.empty((0,), dtype=int),
+                np.empty((0,), dtype=int),
+            )
+
+        feature_ids = self.get_window_feature_ids()
+        intensity = np.asarray(np.mean(intensities, axis=1), dtype=np.float32)
+        if max_points is not None and len(pts) > max_points:
+            pts = pts[:max_points]
+            intensity = intensity[:max_points]
+            feature_ids = feature_ids[:max_points]
+            kf_ids = kf_ids[:max_points]
+        return pts, intensity, feature_ids, kf_ids
+
+    def observe_window_points(self, T_W_C, image_shape=None):
+        """Project active legacy map points into a frame for Sparse3D-style updates."""
+        pts, _, _, _, _ = self.get_window_points()
+        feature_ids = self.get_window_feature_ids()
+        if len(pts) == 0:
+            return {}
+
+        T_C_W = np.linalg.inv(T_W_C)
+        pts_c = pts @ T_C_W[:3, :3].T + T_C_W[:3, 3]
+        z = pts_c[:, 2]
+        valid = z > 0.01
+        if not np.any(valid):
+            return {}
+
+        u = self.K[0, 0] * pts_c[valid, 0] / z[valid] + self.K[0, 2]
+        v = self.K[1, 1] * pts_c[valid, 1] / z[valid] + self.K[1, 2]
+        valid_indices = np.where(valid)[0]
+
+        if image_shape is not None:
+            h, w = image_shape
+            in_bounds = (u >= 1) & (u < w - 1) & (v >= 1) & (v < h - 1)
+            u = u[in_bounds]
+            v = v[in_bounds]
+            valid_indices = valid_indices[in_bounds]
+
+        return {
+            int(feature_ids[i]): np.array([ui, vi], dtype=np.float64)
+            for i, ui, vi in zip(valid_indices, u, v)
+        }

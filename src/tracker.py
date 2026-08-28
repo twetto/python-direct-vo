@@ -4,6 +4,21 @@ import cv2
 import scipy.ndimage as nd
 import sophuspy as sp
 
+
+PATTERN_DX = np.array([0, 1, -1, 0, 0])
+PATTERN_DY = np.array([0, 0, 0, 1, -1])
+PATTERN_SIZE = len(PATTERN_DX)
+
+
+def ensure_pattern_intensities(intensities):
+    intensities = np.asarray(intensities, dtype=np.float32)
+    if intensities.ndim == 1:
+        return np.repeat(intensities[:, None], PATTERN_SIZE, axis=1)
+    if intensities.ndim == 2 and intensities.shape[1] == PATTERN_SIZE:
+        return intensities
+    raise ValueError(f"intensities must have shape (N,) or (N, {PATTERN_SIZE}); got {intensities.shape}")
+
+
 class DirectTracker:
     def __init__(self, K):
         self.K = K
@@ -19,6 +34,7 @@ class DirectTracker:
         Returns the optimized T_C_W matrix, a boolean mask of visible points, and the new (a, b).
         """
         img_cur = img_cur.astype(np.float32)
+        intensities_ref = ensure_pattern_intensities(intensities_ref)
         
         # Compute image gradients using Scharr for the current frame
         grad_x = cv2.Scharr(img_cur, cv2.CV_32F, 1, 0) / 16.0
@@ -59,14 +75,12 @@ class DirectTracker:
             b_ref_i = b_ref[idx]
             
             # Interpolate brightness and gradients for the 5-pixel pattern
-            dx = np.array([0, 1, -1, 0, 0])
-            dy = np.array([0, 0, 0, 1, -1])
-            u_pat = (u[:, None] + dx).flatten()
-            v_pat = (v[:, None] + dy).flatten()
+            u_pat = (u[:, None] + PATTERN_DX).flatten()
+            v_pat = (v[:, None] + PATTERN_DY).flatten()
             
-            cur_intensities = nd.map_coordinates(img_cur, [v_pat, u_pat], order=1).reshape(-1, 5)
-            ix = nd.map_coordinates(grad_x, [v_pat, u_pat], order=1).reshape(-1, 5)
-            iy = nd.map_coordinates(grad_y, [v_pat, u_pat], order=1).reshape(-1, 5)
+            cur_intensities = nd.map_coordinates(img_cur, [v_pat, u_pat], order=1).reshape(-1, PATTERN_SIZE)
+            ix = nd.map_coordinates(grad_x, [v_pat, u_pat], order=1).reshape(-1, PATTERN_SIZE)
+            iy = nd.map_coordinates(grad_y, [v_pat, u_pat], order=1).reshape(-1, PATTERN_SIZE)
             
             # DSO Affine Brightness Residuals (Relative Exposure)
             exp_diff = np.exp(a - a_ref_i)[:, None]
@@ -79,7 +93,7 @@ class DirectTracker:
             J_geo_y = iy * (self.fy * Z_inv)[:, None]
             J_geo_z = -(J_geo_x * X[:, None] + J_geo_y * Y[:, None]) * Z_inv[:, None]
             
-            J = np.zeros((len(u) * 5, 8))
+            J = np.zeros((len(u) * PATTERN_SIZE, 8))
             J[:, 0] = J_geo_x.flatten()
             J[:, 1] = J_geo_y.flatten()
             J[:, 2] = J_geo_z.flatten()
@@ -142,13 +156,11 @@ class DirectTracker:
             
             u, v = u[in_bounds], v[in_bounds]
             
-            dx = np.array([0, 1, -1, 0, 0])
-            dy = np.array([0, 0, 0, 1, -1])
-            u_pat = (u[:, None] + dx).flatten()
-            v_pat = (v[:, None] + dy).flatten()
+            u_pat = (u[:, None] + PATTERN_DX).flatten()
+            v_pat = (v[:, None] + PATTERN_DY).flatten()
             
             cur_ints_flat = nd.map_coordinates(img_cur, [v_pat, u_pat], order=1)
-            cur_ints = cur_ints_flat.reshape(-1, 5)
+            cur_ints = cur_ints_flat.reshape(-1, PATTERN_SIZE)
             
             exp_diff = np.exp(a - a_ref[idx_in_frustum])[:, None]
             bias_diff = (b - b_ref[idx_in_frustum])[:, None]

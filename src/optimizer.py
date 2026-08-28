@@ -2,7 +2,9 @@ import numpy as np
 import cv2
 import scipy.ndimage as nd
 import sophuspy as sp
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize_scalar
+
+from src.tracker import PATTERN_DX, PATTERN_DY, PATTERN_SIZE
 
 class PhotometricBA:
     def __init__(self, K):
@@ -11,6 +13,31 @@ class PhotometricBA:
         self.fy = K[1, 1]
         self.cx = K[0, 2]
         self.cy = K[1, 2]
+
+    def _mono_window(self, mono_window):
+        if hasattr(mono_window, "keyframes") and hasattr(mono_window, "keyframe_reference_records"):
+            return mono_window.keyframes, mono_window
+        return mono_window, None
+
+    def _mono_reference_records(self, mono_map, kf):
+        if mono_map is not None:
+            return mono_map.keyframe_reference_records(kf)
+        refs = []
+        for point_idx, fid in enumerate(kf.landmark_ids):
+            refs.append({
+                "landmark_id": int(fid),
+                "point_idx": int(point_idx),
+                "point_w": np.asarray(kf.points_w[point_idx], dtype=np.float64),
+                "intensity": np.asarray(kf.intensities[point_idx], dtype=np.float32),
+            })
+        return refs
+
+    def _mono_observation_point(self, mono_map, obs):
+        if mono_map is not None:
+            track = mono_map.landmarks.get(int(obs.landmark_id))
+            if track is not None:
+                return np.asarray(track.point_w, dtype=np.float64)
+        return np.asarray(obs.point_w, dtype=np.float64)
 
     def optimize_window(self, keyframes, max_iters=10):
         """
@@ -265,3 +292,389 @@ class PhotometricBA:
                 R_W_C = kf.T_W_C[:3, :3]
                 t_W_C = kf.T_W_C[:3, 3]
                 kf.pts_3d_w = (R_W_C @ kf.pts_3d_c.T).T + t_W_C
+
+    def optimize_mono_pose_window(self, mono_window, max_iters=3, max_points_per_host=120):
+        """
+        Pose-only photometric BA for mono keyframes.
+        Landmarks are fixed world points from Sparse3D; the oldest keyframe is the gauge.
+        """
+        keyframes, mono_map = self._mono_window(mono_window)
+        if len(keyframes) < 2:
+            return {"ran": False, "window": len(keyframes), "residuals": 0}
+
+        n_opt = len(keyframes) - 1
+        x0 = np.zeros(n_opt * 6)
+        original_poses = [kf.T_W_C.copy() for kf in keyframes]
+        active_pairs = []
+
+        for i, kf_host in enumerate(keyframes):
+            refs = self._mono_reference_records(mono_map, kf_host)
+            if len(refs) == 0:
+                continue
+            step = max(1, len(refs) // max_points_per_host)
+            refs = refs[::step]
+            pts_w = np.asarray([ref["point_w"] for ref in refs], dtype=np.float64)
+            ref_ints = np.asarray([ref["intensity"] for ref in refs], dtype=np.float32)
+            for j, kf_target in enumerate(keyframes):
+                if i == j:
+                    continue
+                mask = self._visible_mask(pts_w, original_poses[j], kf_target.image.shape)
+                if np.sum(mask) > 10:
+                    active_pairs.append({
+                        "i": i,
+                        "j": j,
+                        "pts_w": pts_w[mask],
+                        "ref_ints": ref_ints[mask],
+                    })
+
+        if not active_pairs:
+            return {"ran": False, "window": len(keyframes), "residuals": 0}
+
+        def current_poses(x):
+            poses = [original_poses[0]]
+            for i in range(n_opt):
+                delta = x[i * 6:(i + 1) * 6]
+                poses.append(original_poses[i + 1] @ sp.SE3.exp(delta).matrix())
+            return poses
+
+        def residual_fn(x):
+            poses = current_poses(x)
+            residuals = []
+            for pair in active_pairs:
+                i = pair["i"]
+                j = pair["j"]
+                pts_w = pair["pts_w"]
+                T_C_W = np.linalg.inv(poses[j])
+                pts_c = pts_w @ T_C_W[:3, :3].T + T_C_W[:3, 3]
+                z = np.clip(pts_c[:, 2], 0.01, None)
+                u = self.fx * pts_c[:, 0] / z + self.cx
+                v = self.fy * pts_c[:, 1] / z + self.cy
+                h, w = keyframes[j].image.shape
+                u_pat = (u[:, None] + PATTERN_DX).reshape(-1)
+                v_pat = (v[:, None] + PATTERN_DY).reshape(-1)
+                target = nd.map_coordinates(
+                    keyframes[j].image,
+                    [np.clip(v_pat, 0, h - 1), np.clip(u_pat, 0, w - 1)],
+                    order=1,
+                ).reshape(-1, PATTERN_SIZE)
+                exp_diff = np.exp(keyframes[j].affine_a - keyframes[i].affine_a)
+                bias_diff = keyframes[j].affine_b - keyframes[i].affine_b
+                res = exp_diff * pair["ref_ints"] + bias_diff - target
+                invalid = (pts_c[:, 2] < 0.01) | (u < 1) | (u > w - 2) | (v < 1) | (v > h - 2)
+                res[invalid] = 0.0
+                residuals.append(res.reshape(-1))
+            return np.concatenate(residuals)
+
+        res = least_squares(
+            residual_fn,
+            x0,
+            bounds=(-0.05, 0.05),
+            method="trf",
+            loss="huber",
+            f_scale=10.0,
+            max_nfev=max_iters,
+        )
+
+        for i in range(n_opt):
+            delta = res.x[i * 6:(i + 1) * 6]
+            keyframes[i + 1].T_W_C = original_poses[i + 1] @ sp.SE3.exp(delta).matrix()
+
+        return {"ran": True, "window": len(keyframes), "residuals": int(res.fun.size)}
+
+    def optimize_mono_inverse_depth_window(
+        self,
+        mono_window,
+        max_iters=5,
+        max_landmarks=180,
+        max_targets_per_landmark=4,
+        max_initial_photometric_error=80.0,
+        max_abs_log_depth_update=0.12,
+    ):
+        """
+        Refine mono landmark inverse depths along their host keyframe rays.
+        Poses are fixed; high-error target projections are treated as occluded and skipped.
+        """
+        keyframes, mono_map = self._mono_window(mono_window)
+        if len(keyframes) < 2:
+            return {
+                "ran": False,
+                "window": len(keyframes),
+                "landmarks": 0,
+                "edges": 0,
+                "cost_before": 0.0,
+                "cost_after": 0.0,
+                "updated": 0,
+                "median_abs_log_depth_update": 0.0,
+                "max_abs_log_depth_update": 0.0,
+            }
+
+        original_poses = [kf.T_W_C.copy() for kf in keyframes]
+        hosts = []
+        seen = set()
+        for host_idx, kf in enumerate(keyframes):
+            refs = self._mono_reference_records(mono_map, kf)
+            if len(refs) == 0:
+                continue
+            for ref in refs:
+                fid_i = int(ref["landmark_id"])
+                if fid_i in seen:
+                    continue
+                seen.add(fid_i)
+                T_C_W_host = np.linalg.inv(original_poses[host_idx])
+                p_host = T_C_W_host[:3, :3] @ np.asarray(ref["point_w"], dtype=np.float64) + T_C_W_host[:3, 3]
+                if p_host[2] <= 0.05:
+                    continue
+                bearing = p_host / np.linalg.norm(p_host)
+                depth_along_ray = np.linalg.norm(p_host)
+                if depth_along_ray <= 0.05:
+                    continue
+                hosts.append({
+                    "fid": fid_i,
+                    "host_idx": host_idx,
+                    "point_idx": int(ref["point_idx"]),
+                    "bearing": bearing,
+                    "rho0": 1.0 / depth_along_ray,
+                    "ref_ints": np.asarray(ref["intensity"], dtype=np.float64),
+                })
+
+        if len(hosts) > max_landmarks:
+            step = max(1, len(hosts) // max_landmarks)
+            hosts = hosts[::step][:max_landmarks]
+
+        edges = []
+        for var_idx, host in enumerate(hosts):
+            host_pose = original_poses[host["host_idx"]]
+            p_host0 = host["bearing"] / host["rho0"]
+            point_w0 = host_pose[:3, :3] @ p_host0 + host_pose[:3, 3]
+            target_edges = []
+            for target_idx, target_kf in enumerate(keyframes):
+                if target_idx == host["host_idx"]:
+                    continue
+                error = self._mono_patch_error(
+                    point_w0,
+                    host["ref_ints"],
+                    host["host_idx"],
+                    target_idx,
+                    original_poses[target_idx],
+                    keyframes,
+                )
+                if error is None or error > max_initial_photometric_error:
+                    continue
+                target_edges.append((var_idx, target_idx))
+                if len(target_edges) >= max_targets_per_landmark:
+                    break
+            edges.extend(target_edges)
+
+        if len(edges) < 10:
+            return {
+                "ran": False,
+                "window": len(keyframes),
+                "landmarks": len(hosts),
+                "edges": len(edges),
+                "cost_before": 0.0,
+                "cost_after": 0.0,
+                "updated": 0,
+                "median_abs_log_depth_update": 0.0,
+                "max_abs_log_depth_update": 0.0,
+            }
+
+        def point_for_host(host, log_rho_delta):
+            rho = host["rho0"] * np.exp(log_rho_delta)
+            p_host = host["bearing"] / max(rho, 1e-9)
+            host_pose = original_poses[host["host_idx"]]
+            return host_pose[:3, :3] @ p_host + host_pose[:3, 3]
+
+        edges_by_landmark = [[] for _ in hosts]
+        for var_idx, target_idx in edges:
+            edges_by_landmark[var_idx].append(target_idx)
+
+        def landmark_residuals(var_idx, log_rho_delta):
+            host = hosts[var_idx]
+            point_w = point_for_host(host, log_rho_delta)
+            residuals = []
+            for target_idx in edges_by_landmark[var_idx]:
+                res = self._mono_patch_residual(
+                    point_w,
+                    host["ref_ints"],
+                    host["host_idx"],
+                    target_idx,
+                    original_poses[target_idx],
+                    keyframes,
+                )
+                if res is None:
+                    residuals.extend([0.0] * PATTERN_SIZE)
+                else:
+                    residuals.extend(res.tolist())
+            return np.asarray(residuals, dtype=np.float64)
+
+        def robust_abs_cost(residuals):
+            if len(residuals) == 0:
+                return 0.0
+            abs_res = np.abs(residuals)
+            delta = 10.0
+            loss = np.where(abs_res <= delta, 0.5 * abs_res * abs_res, delta * (abs_res - 0.5 * delta))
+            return float(np.mean(loss))
+
+        r0 = np.concatenate([landmark_residuals(i, 0.0) for i in range(len(hosts)) if edges_by_landmark[i]])
+        cost_before = float(np.mean(np.abs(r0))) if len(r0) else 0.0
+        optimized_log_rho = np.zeros(len(hosts), dtype=np.float64)
+        max_abs_log_depth_update = float(max(1e-3, max_abs_log_depth_update))
+        bounds = (-max_abs_log_depth_update, max_abs_log_depth_update)
+        for var_idx in range(len(hosts)):
+            if not edges_by_landmark[var_idx]:
+                continue
+
+            def objective(log_rho_delta):
+                return robust_abs_cost(landmark_residuals(var_idx, log_rho_delta))
+
+            opt = minimize_scalar(
+                objective,
+                bounds=bounds,
+                method="bounded",
+                options={"maxiter": max(3, int(max_iters))},
+            )
+            if np.isfinite(opt.x) and np.isfinite(opt.fun) and opt.fun <= objective(0.0):
+                optimized_log_rho[var_idx] = float(opt.x)
+
+        r_after = np.concatenate([
+            landmark_residuals(i, optimized_log_rho[i]) for i in range(len(hosts)) if edges_by_landmark[i]
+        ])
+        cost_after = float(np.mean(np.abs(r_after))) if len(r_after) else 0.0
+
+        refined_points = {}
+        for var_idx, host in enumerate(hosts):
+            refined_points[host["fid"]] = point_for_host(host, optimized_log_rho[var_idx])
+
+        abs_updates = np.abs(optimized_log_rho)
+        updated = int(np.sum(abs_updates > 1e-4))
+
+        for kf in keyframes:
+            if len(kf.landmark_ids) > 0:
+                for point_idx, fid in enumerate(kf.landmark_ids):
+                    point_w = refined_points.get(int(fid))
+                    if point_w is not None:
+                        kf.points_w[point_idx] = point_w
+            for obs in kf.observations.values():
+                point_w = refined_points.get(int(obs.landmark_id))
+                if point_w is not None:
+                    obs.point_w = point_w.copy()
+
+        if mono_map is not None:
+            mono_map.sync_landmark_tracks_from_keyframes()
+
+        return {
+            "ran": True,
+            "window": len(keyframes),
+            "landmarks": len(hosts),
+            "edges": len(edges),
+            "cost_before": cost_before,
+            "cost_after": cost_after,
+            "updated": updated,
+            "median_abs_log_depth_update": float(np.median(abs_updates)) if len(abs_updates) else 0.0,
+            "max_abs_log_depth_update": float(np.max(abs_updates)) if len(abs_updates) else 0.0,
+        }
+
+    def optimize_mono_geometric_pose_window(self, mono_window, max_iters=5, max_obs_per_keyframe=300):
+        """
+        Pose-only geometric BA for mono keyframes with fixed Sparse3D world points.
+        Observation residuals are reprojection errors in pixels; keyframe 0 is fixed.
+        """
+        keyframes, mono_map = self._mono_window(mono_window)
+        if len(keyframes) < 2:
+            return {"ran": False, "window": len(keyframes), "edges": 0}
+
+        n_opt = len(keyframes) - 1
+        original_poses = [kf.T_W_C.copy() for kf in keyframes]
+        edges = []
+        for kf_idx, kf in enumerate(keyframes):
+            observations = list(kf.observations.values())
+            if len(observations) > max_obs_per_keyframe:
+                step = max(1, len(observations) // max_obs_per_keyframe)
+                observations = observations[::step]
+            for obs in observations:
+                point_w = self._mono_observation_point(mono_map, obs)
+                if not self._visible_mask(np.asarray([point_w]), original_poses[kf_idx], kf.image.shape)[0]:
+                    continue
+                sigma = np.sqrt(np.maximum(np.diag(obs.covariance), 1e-9))
+                edges.append((kf_idx, point_w.copy(), obs.pixel.copy(), sigma))
+
+        if len(edges) < 10:
+            return {"ran": False, "window": len(keyframes), "edges": len(edges)}
+
+        x0 = np.zeros(n_opt * 6)
+
+        def current_poses(x):
+            poses = [original_poses[0]]
+            for i in range(n_opt):
+                delta = x[i * 6:(i + 1) * 6]
+                poses.append(original_poses[i + 1] @ sp.SE3.exp(delta).matrix())
+            return poses
+
+        def residual_fn(x):
+            poses = current_poses(x)
+            residuals = []
+            for kf_idx, point_w, pixel, sigma in edges:
+                T_C_W = np.linalg.inv(poses[kf_idx])
+                p = T_C_W[:3, :3] @ point_w + T_C_W[:3, 3]
+                if p[2] <= 0.01:
+                    residuals.extend([0.0, 0.0])
+                    continue
+                pred = np.array([
+                    self.fx * p[0] / p[2] + self.cx,
+                    self.fy * p[1] / p[2] + self.cy,
+                ])
+                residuals.extend(((pred - pixel) / sigma).tolist())
+            return np.asarray(residuals, dtype=np.float64)
+
+        res = least_squares(
+            residual_fn,
+            x0,
+            bounds=(-0.05, 0.05),
+            method="trf",
+            loss="huber",
+            f_scale=3.0,
+            max_nfev=max_iters,
+        )
+
+        for i in range(n_opt):
+            delta = res.x[i * 6:(i + 1) * 6]
+            keyframes[i + 1].T_W_C = original_poses[i + 1] @ sp.SE3.exp(delta).matrix()
+
+        return {"ran": True, "window": len(keyframes), "edges": len(edges)}
+
+    def _visible_mask(self, pts_w, T_W_C, image_shape):
+        if len(pts_w) == 0:
+            return np.zeros((0,), dtype=bool)
+        T_C_W = np.linalg.inv(T_W_C)
+        pts_c = pts_w @ T_C_W[:3, :3].T + T_C_W[:3, 3]
+        z = pts_c[:, 2]
+        valid = z > 0.01
+        u = self.fx * pts_c[:, 0] / np.clip(z, 0.01, None) + self.cx
+        v = self.fy * pts_c[:, 1] / np.clip(z, 0.01, None) + self.cy
+        h, w = image_shape
+        return valid & (u >= 1) & (u < w - 2) & (v >= 1) & (v < h - 2)
+
+    def _mono_patch_error(self, point_w, ref_ints, host_idx, target_idx, T_W_C_target, keyframes):
+        residual = self._mono_patch_residual(point_w, ref_ints, host_idx, target_idx, T_W_C_target, keyframes)
+        if residual is None:
+            return None
+        return float(np.mean(np.abs(residual)))
+
+    def _mono_patch_residual(self, point_w, ref_ints, host_idx, target_idx, T_W_C_target, keyframes):
+        target_kf = keyframes[target_idx]
+        T_C_W = np.linalg.inv(T_W_C_target)
+        p = T_C_W[:3, :3] @ point_w + T_C_W[:3, 3]
+        if p[2] <= 0.01:
+            return None
+        u = self.fx * p[0] / p[2] + self.cx
+        v = self.fy * p[1] / p[2] + self.cy
+        h, w = target_kf.image.shape
+        if u < 1 or u > w - 2 or v < 1 or v > h - 2:
+            return None
+        u_pat = u + PATTERN_DX
+        v_pat = v + PATTERN_DY
+        target = nd.map_coordinates(target_kf.image, [v_pat, u_pat], order=1)
+        exp_diff = np.exp(target_kf.affine_a - keyframes[host_idx].affine_a)
+        bias_diff = target_kf.affine_b - keyframes[host_idx].affine_b
+        predicted = exp_diff * ref_ints + bias_diff
+        return predicted - target
