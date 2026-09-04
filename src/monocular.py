@@ -220,7 +220,7 @@ class ExperimentalMonocularVO:
         # VO map once it has real anchor->current parallax, using the filter's own
         # (birth-triangulated, recursively refined) depth -- one estimator, not two.
         # KLT outlier rejection is already handled upstream by FeatureTracker's RANSAC.
-        self.map_promotion_min_parallax_deg = 5.0
+        self.map_promotion_min_parallax_deg = 2.0
         # Scale-invariant keyframing (SVO needNewKf, frame_handler_base.cpp). Metric
         # motion is unusable in an under-scaled mono frame; pixel disparity vs the last
         # keyframe and tracked-landmark count are scale-invariant. EuRoC values from
