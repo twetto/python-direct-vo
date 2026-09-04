@@ -8,6 +8,7 @@ from src.feature_tracker import FeatureTracker, FeatureTrackerConfig
 from src.landmark_filter import LandmarkStatus, Sparse3DFilterBank, Sparse3DSettings, bearing_from_pixel, two_ray_ranges
 from src.mono_map import MonoMap, MonoMapConfig
 from src.optimizer import PhotometricBA
+from src.profiler import profiler
 from src.tracker import DirectTracker, PATTERN_DX, PATTERN_DY, PATTERN_SIZE, ensure_pattern_intensities
 
 
@@ -252,7 +253,9 @@ class ExperimentalMonocularVO:
         self.last_landmark_reproj_after_px = 0.0
         exclusion_points = self._project_existing_map_landmarks(image.shape)
         self.last_gftt_exclusions = len(exclusion_points)
+        profiler.start("mono/feature_track")
         observations = self.feature_tracker.update(image, exclusion_points=exclusion_points)
+        profiler.stop("mono/feature_track")
         self._current_observations = observations
         seeded_sparse_depth = self._ensure_first_keyframe(frame_id, image, observations)
 
@@ -283,20 +286,26 @@ class ExperimentalMonocularVO:
             self._reset_essential_diagnostics(observations)
             self.last_svo_match_stats = self._empty_svo_match_stats("klt_pnp")
             old_T_W_C = self.T_W_C.copy()
+            profiler.start("mono/visible_klt")
             visible_refs = self.mono_map.visible_references(self.T_W_C, image.shape)
             klt_pixel_guesses = self._keyframe_klt_pixel_guesses(image, visible_refs)
+            profiler.stop("mono/visible_klt")
             # 1) Absolute pose from the reliable KLT 2D-3D correspondences (drift-free).
+            profiler.start("mono/pnp")
             T_C_W_pnp, pnp_inliers = self._pnp_from_klt(visible_refs, klt_pixel_guesses)
+            profiler.stop("mono/pnp")
             if T_C_W_pnp is not None:
                 direct_attempted = True
                 # 2) Direct photometric refinement seeded from the PnP pose.
                 pts_w, ints, a_ref, b_ref, ids = self.mono_map.direct_references(np.linalg.inv(T_C_W_pnp))
                 direct_landmarks = int(len(pts_w))
                 if len(pts_w) >= self.min_direct_landmarks:
+                    profiler.start("mono/track_map")
                     T_C_W_out, inl, a_opt, b_opt = self.direct_tracker.track_map(
                         image, pts_w, ints, a_ref, b_ref, T_C_W_pnp,
                         self.current_a, self.current_b, max_iters=10,
                     )
+                    profiler.stop("mono/track_map")
                     self.T_W_C = np.linalg.inv(T_C_W_out)
                     self.current_a = a_opt
                     self.current_b = b_opt
@@ -319,13 +328,19 @@ class ExperimentalMonocularVO:
         # Post-bootstrap: keep Sparse3D refining depths for future keyframes.
         # (KLT tracks are already fundamental-RANSAC filtered inside FeatureTracker.)
         if used_direct and self.bootstrap_complete:
+            profiler.start("mono/sparse3d")
             self.sparse3d.update(frame_id, observations, self.T_W_C, remove_missing=False)
+            profiler.stop("mono/sparse3d")
         if used_direct and len(self.mono_map) > 0 and visible_refs and klt_pixel_guesses:
             self._update_map_landmarks_from_klt(image.shape, visible_refs, klt_pixel_guesses, self.T_W_C)
         if not self.last_keyframe_inserted:
+            profiler.start("mono/keyframe_ba")
             self._maybe_add_keyframe(frame_id, image, observations, used_direct, direct_inliers, direct_landmarks, klt_pixel_guesses)
+            profiler.stop("mono/keyframe_ba")
         if used_direct and self.bootstrap_complete:
+            profiler.start("mono/reanchor")
             self._reanchor_klt_to_reprojection(image.shape)
+            profiler.stop("mono/reanchor")
         motion_step_norm = float(np.linalg.norm(self.T_W_C[:3, 3] - self.last_T_W_C[:3, 3]))
         rotation_step_deg = float(np.rad2deg(_rotation_angle(self.last_T_W_C[:3, :3].T @ self.T_W_C[:3, :3])))
         self._update_keyframe_klt_residual_stats(image.shape)

@@ -691,6 +691,14 @@ class PhotometricBA:
         n_res = 2 * n_repro + 3 * n_pts
         n_var = 6 * n_opt + 3 * n_pts
 
+        # Precompute per-edge arrays so the residual is fully vectorized (scipy's
+        # numerical Jacobian calls it hundreds of times).
+        edge_kf = np.array([e[0] for e in edges], dtype=int)
+        edge_pt = np.array([e[1] for e in edges], dtype=int)
+        edge_pixel = np.asarray([e[2] for e in edges], dtype=np.float64).reshape(-1, 2)
+        edge_sigma = np.asarray([e[3] for e in edges], dtype=np.float64).reshape(-1, 2)
+        prior_L_T = np.transpose(prior_L, (0, 2, 1))
+
         def unpack(x):
             poses = [original_poses[0]]
             for i in range(n_opt):
@@ -699,16 +707,23 @@ class PhotometricBA:
 
         def residual_fn(x):
             poses, points = unpack(x)
+            R_cw = np.empty((len(poses), 3, 3))
+            t_cw = np.empty((len(poses), 3))
+            for k, T in enumerate(poses):
+                Ti = np.linalg.inv(T)
+                R_cw[k], t_cw[k] = Ti[:3, :3], Ti[:3, 3]
             r = np.zeros(n_res)
-            for e, (i, j, pixel, sigma) in enumerate(edges):
-                T_C_W = np.linalg.inv(poses[i])
-                p = T_C_W[:3, :3] @ points[j] + T_C_W[:3, 3]
-                if p[2] > 0.01:
-                    pred = np.array([self.fx * p[0] / p[2] + self.cx, self.fy * p[1] / p[2] + self.cy])
-                    r[2 * e:2 * e + 2] = (pred - pixel) / sigma
-            base = 2 * n_repro
-            for j in range(n_pts):
-                r[base + 3 * j:base + 3 * j + 3] = prior_L[j].T @ (points[j] - priors[j])
+            if n_repro:
+                p = np.einsum("eij,ej->ei", R_cw[edge_kf], points[edge_pt]) + t_cw[edge_kf]
+                z = p[:, 2]
+                valid = z > 0.01
+                z_safe = np.where(valid, z, 1.0)
+                pred = np.stack([self.fx * p[:, 0] / z_safe + self.cx,
+                                 self.fy * p[:, 1] / z_safe + self.cy], axis=1)
+                res_repro = (pred - edge_pixel) / edge_sigma
+                res_repro[~valid] = 0.0
+                r[:2 * n_repro] = res_repro.reshape(-1)
+            r[2 * n_repro:] = np.einsum("nij,nj->ni", prior_L_T, points - priors).reshape(-1)
             return r
 
         S = lil_matrix((n_res, n_var), dtype=bool)
