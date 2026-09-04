@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import scipy.ndimage as nd
 
+from src.edgelet import optimize_pose_2d1d
 from src.feature_tracker import FeatureTracker, FeatureTrackerConfig
 from src.landmark_filter import LandmarkStatus, Sparse3DFilterBank, Sparse3DSettings, bearing_from_pixel, two_ray_ranges
 from src.mono_map import MonoMap, MonoMapConfig
@@ -241,6 +242,24 @@ class ExperimentalMonocularVO:
         self.landmark_update_max_reprojection_px = 8.0
         self.landmark_update_min_parallax_sin = 0.003
         self.landmark_update_max_abs_log_range = 0.06
+        # SVO-style mature-point health: re-check each visible map point against its
+        # reference patch every frame. A point whose host-patch photometric residual
+        # exceeds an adaptive (median+MAD) bar N frames in a row -- occluded, or floated
+        # onto the wrong texture -- is deleted (reprojector.cpp n_failed_reproj). The
+        # adaptive bar means a global transient (blur/exposure) raises it for everyone
+        # instead of culling good points.
+        self.health_min_fail_error = 25.0
+        self.health_mad_factor = 3.0
+        self.health_max_consecutive_fail = 3
+        self.last_health_removed = 0
+        # Edgelet pose refine engages only when corners can't constrain the pose:
+        # fewer than `edge_refine_min_corner` corner correspondences and at least
+        # `edge_refine_min_edge` edgelets to contribute point-to-line constraints.
+        self.edge_refine_min_corner = 40
+        self.edge_refine_min_edge = 8
+        # Promote an edgelet only when its anchor->current parallax is within ~45deg of
+        # the edge normal (cos >= 0.7), so its depth is observable (SVO epi/edge angle).
+        self.edgelet_min_epi_cos = 0.7
 
     def process(self, frame_id: int, image: np.ndarray) -> MonocularVOResult:
         self.last_keyframe_inserted = False
@@ -295,6 +314,14 @@ class ExperimentalMonocularVO:
             T_C_W_pnp, pnp_inliers = self._pnp_from_klt(visible_refs, klt_pixel_guesses)
             profiler.stop("mono/pnp")
             if T_C_W_pnp is not None:
+                # SVO edgelet pose refine: point-to-line for edge features (2D/1D GN),
+                # engaged only where corners can't constrain the pose (see gate inside).
+                profiler.start("mono/pose_2d1d")
+                T_refined, refined_inliers = self._refine_pose_2d1d(
+                    image, visible_refs, klt_pixel_guesses, T_C_W_pnp)
+                if refined_inliers >= self.pnp_min_inliers:
+                    T_C_W_pnp, pnp_inliers = T_refined, refined_inliers
+                profiler.stop("mono/pose_2d1d")
                 direct_attempted = True
                 # 2) Direct photometric refinement seeded from the PnP pose.
                 pts_w, ints, a_ref, b_ref, ids = self.mono_map.direct_references(np.linalg.inv(T_C_W_pnp))
@@ -314,6 +341,7 @@ class ExperimentalMonocularVO:
                     self.T_W_C = np.linalg.inv(T_C_W_pnp)  # too few map refs; trust PnP
                     direct_inliers = int(pnp_inliers)
                 self.last_direct_delta = np.linalg.inv(old_T_W_C) @ self.T_W_C
+                self._update_landmark_health(image, ids, pts_w, ints, a_ref, b_ref)
                 self.have_direct_motion_model = True
                 self.last_keyframe_klt_used = True
                 used_direct = True
@@ -859,7 +887,7 @@ class ExperimentalMonocularVO:
             require_converged=False,
         )
         keep = self._map_promotion_parallax_mask(pts_w, ids)
-        keep &= self._map_promotion_klt_agreement_mask(pts_w, ids, image.shape)
+        keep &= self._map_promotion_klt_agreement_mask(pts_w, ids, image)
         pts_w, intensities, ids = pts_w[keep], intensities[keep], ids[keep]
         inserted = self.mono_map.add_keyframe(
             frame_id,
@@ -1346,6 +1374,50 @@ class ExperimentalMonocularVO:
         errors = np.mean(np.abs(cur_intensities - predicted), axis=1)
         return errors.astype(np.float32), visible
 
+    def _update_landmark_health(
+        self,
+        image: np.ndarray,
+        ids: np.ndarray,
+        pts_w: np.ndarray,
+        intensities: np.ndarray,
+        a_ref: np.ndarray,
+        b_ref: np.ndarray,
+    ) -> None:
+        """SVO mature-point health check (reprojector.cpp n_failed_reproj_).
+
+        Re-evaluate each visible map point against its reference patch at the refined
+        pose. `n_failed_reproj` is used as a CONSECUTIVE counter (reset on success)
+        rather than SVO's cumulative one, because our points are long-lived: a point
+        that tracked well for hundreds of frames then gets occluded must die on a few
+        consecutive misses, not wait for cumulative failures to overtake successes.
+        """
+        self.last_health_removed = 0
+        if len(ids) == 0 or len(self.mono_map.landmarks) == 0:
+            return
+        residuals, visible = self._direct_reference_photometric_errors(
+            image, self.T_W_C, pts_w, intensities, a_ref, b_ref
+        )
+        if len(residuals) == 0:
+            return
+        median = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - median)))
+        thresh = max(self.health_min_fail_error, median + self.health_mad_factor * 1.4826 * mad)
+        ids_visible = np.asarray(ids)[np.flatnonzero(visible)]
+        removed = 0
+        for res, fid in zip(residuals, ids_visible):
+            track = self.mono_map.landmarks.get(int(fid))
+            if track is None:
+                continue
+            if res > thresh:
+                track.n_failed_reproj += 1
+                if track.n_failed_reproj >= self.health_max_consecutive_fail:
+                    self.mono_map.remove_landmark(int(fid))
+                    removed += 1
+            else:
+                track.n_failed_reproj = 0
+                track.n_succeeded_reproj += 1
+        self.last_health_removed = removed
+
     def _direct_candidate_score(self, inlier_count: int, klt_residual_stats: dict[str, float]) -> float:
         score = float(inlier_count)
         if klt_residual_stats["count"] < self.candidate_klt_residual_gate_tracks:
@@ -1483,24 +1555,57 @@ class ExperimentalMonocularVO:
         if reanchor:
             self.feature_tracker.set_positions(reanchor)
 
-    def _map_promotion_klt_agreement_mask(self, points_w: np.ndarray, ids: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+    def _map_promotion_klt_agreement_mask(self, points_w: np.ndarray, ids: np.ndarray, image: np.ndarray) -> np.ndarray:
         """Reject promotion candidates whose reprojection disagrees with the KLT track.
 
-        KLT gives the true feature location; if a filter landmark's triangulated point
-        reprojects far from it, its depth is wrong -- don't put it in the map. Gated by
-        the same tolerance PnP uses (`pnp_reproj_thresh`).
+        Corners: full 2D disagreement (KLT gives the true location; a far reprojection
+        means wrong depth). Edgelets: KLT slides freely ALONG the edge, so only the
+        perpendicular (normal) disagreement is meaningful -- and the edgelet's depth is
+        only observable when the anchor->current parallax crosses the edge (SVO's
+        epi_search_edgelet angle check), so reject edgelets whose parallax runs along
+        the edge (depth unobservable -> garbage triangulation).
         """
-        keep = np.ones(len(ids), dtype=bool)  # default keep; only KLT disagreement rejects
+        keep = np.ones(len(ids), dtype=bool)  # default keep; only disagreement rejects
         if len(ids) == 0:
             return keep
+        image_shape = image.shape
         obs = self._current_observations or {}
+        edge_ids = self.feature_tracker.edgelet_ids()
+        img_f = image.astype(np.float32)
+        gx = cv2.Scharr(img_f, cv2.CV_32F, 1, 0) / 16.0
+        gy = cv2.Scharr(img_f, cv2.CV_32F, 0, 1) / 16.0
+        h, w = image_shape
         uv, _z, visible = self._project_points(self.T_W_C, points_w, image_shape)
         for i, fid in enumerate(ids):
             klt = obs.get(int(fid))
             if klt is None or not visible[i]:
                 continue  # no KLT result (or not visible) -> nothing to disagree with here
-            if float(np.linalg.norm(uv[i] - np.asarray(klt, dtype=np.float64))) > self.pnp_reproj_thresh:
+            klt = np.asarray(klt, dtype=np.float64)
+            disp = uv[i] - klt
+            if int(fid) not in edge_ids:
+                if float(np.linalg.norm(disp)) > self.pnp_reproj_thresh:
+                    keep[i] = False
+                continue
+            # edgelet: normal from the current image gradient at the KLT pixel
+            x, y = int(round(klt[0])), int(round(klt[1]))
+            g = np.array([gx[y, x], gy[y, x]], dtype=np.float64) if (0 <= x < w and 0 <= y < h) else np.zeros(2)
+            ng = float(np.linalg.norm(g))
+            if ng < 1e-6:  # no gradient -> fall back to the corner (2D) test
+                if float(np.linalg.norm(disp)) > self.pnp_reproj_thresh:
+                    keep[i] = False
+                continue
+            n = g / ng
+            if abs(float(n @ disp)) > self.pnp_reproj_thresh:  # 1D perpendicular disagreement
                 keep[i] = False
+                continue
+            lm = self.sparse3d.features.get(int(fid))  # epipolar-angle depth observability
+            if lm is not None:
+                a_uv, _az, a_vis = self._project_points(lm.anchor_T_W_C, points_w[i:i + 1], image_shape)
+                if a_vis[0]:
+                    par = uv[i] - a_uv[0]
+                    pn = float(np.linalg.norm(par))
+                    if pn > 1e-3 and abs(float(n @ (par / pn))) < self.edgelet_min_epi_cos:
+                        keep[i] = False  # parallax runs along the edge -> depth unobservable
         return keep
 
     def _pnp_from_klt(
@@ -1539,6 +1644,70 @@ class ExperimentalMonocularVO:
         T_C_W[:3, :3] = R
         T_C_W[:3, 3] = tvec.reshape(3)
         return T_C_W, int(len(inliers))
+
+    def _refine_pose_2d1d(
+        self,
+        image: np.ndarray,
+        refs: list[dict],
+        klt_pixel_guesses: dict[int, np.ndarray],
+        T_C_W_init: np.ndarray,
+    ) -> tuple[np.ndarray, int]:
+        """SVO pose_optimizer: robust GN mixing 2D (corner) and 1D point-to-line
+        (edgelet) reprojection residuals, seeded from the PnP pose. Edge features that
+        slid along their edge under KLT then constrain only their perpendicular
+        direction instead of poisoning the pose with the aperture-ambiguous slide.
+        """
+        if not refs or not klt_pixel_guesses:
+            return T_C_W_init, 0
+        edge_ids = self.feature_tracker.edgelet_ids()
+        if not edge_ids:
+            return T_C_W_init, 0  # nothing to gain; keep PnP pose
+        ref_by_id = {int(r["landmark_id"]): r for r in refs}
+        img_f = image.astype(np.float32)
+        gx = cv2.Scharr(img_f, cv2.CV_32F, 1, 0) / 16.0
+        gy = cv2.Scharr(img_f, cv2.CV_32F, 0, 1) / 16.0
+        h, w = image.shape
+        pts, meas, is_edge, normals = [], [], [], []
+        for fid, pixel in klt_pixel_guesses.items():
+            ref = ref_by_id.get(int(fid))
+            if ref is None:
+                continue
+            pts.append(ref["point_w"])
+            meas.append(pixel)
+            if int(fid) in edge_ids:
+                x, y = int(round(pixel[0])), int(round(pixel[1]))
+                if 0 <= x < w and 0 <= y < h:
+                    g = np.array([gx[y, x], gy[y, x]], dtype=np.float64)
+                    ng = float(np.linalg.norm(g))
+                else:
+                    ng = 0.0
+                if ng > 1e-6:
+                    is_edge.append(True)
+                    normals.append(g / ng)
+                else:  # no usable gradient -> treat as a plain 2D point
+                    is_edge.append(False)
+                    normals.append(np.zeros(2))
+            else:
+                is_edge.append(False)
+                normals.append(np.zeros(2))
+        is_edge = np.asarray(is_edge, dtype=bool)
+        n_edge = int(np.sum(is_edge))
+        n_corner = len(pts) - n_edge
+        # Engage the edgelet refine only where corners are actually insufficient to
+        # constrain the pose. In corner-rich frames PnP is already optimal and the
+        # extra 1D constraints only inject a small systematic bias that -- through the
+        # reanchor loop -- accumulates into a translation freeze.
+        if n_corner >= self.edge_refine_min_corner or n_edge < self.edge_refine_min_edge:
+            return T_C_W_init, 0
+        if len(pts) < self.pnp_min_correspondences:
+            return T_C_W_init, 0
+        T_out, inl = optimize_pose_2d1d(
+            self.K, np.asarray(pts), np.asarray(meas), is_edge,
+            np.asarray(normals), T_C_W_init, max_iters=10,
+            huber_px=self.pnp_reproj_thresh, edge_weight=0.5,
+            reproj_inlier_px=self.pnp_reproj_thresh,
+        )
+        return T_out, int(np.sum(inl))
 
     def _map_promotion_parallax_mask(self, points_w: np.ndarray, ids: np.ndarray) -> np.ndarray:
         """Keep only landmarks with real anchor->current parallax for map promotion.
