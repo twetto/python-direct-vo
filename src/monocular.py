@@ -234,6 +234,9 @@ class ExperimentalMonocularVO:
         self.pnp_min_correspondences = 12
         self.pnp_reproj_thresh = 3.0
         self.pnp_min_inliers = 12
+        # Re-anchor KLT map-point tracks to the pose-refined reprojection each frame
+        # (kills the edge-drift ratchet), gated by the SAME tolerance PnP uses to call a
+        # correspondence an inlier -- re-anchor exactly the points PnP trusts.
         self.landmark_update_max_reprojection_px = 8.0
         self.landmark_update_min_parallax_sin = 0.003
         self.landmark_update_max_abs_log_range = 0.06
@@ -321,6 +324,8 @@ class ExperimentalMonocularVO:
             self._update_map_landmarks_from_klt(image.shape, visible_refs, klt_pixel_guesses, self.T_W_C)
         if not self.last_keyframe_inserted:
             self._maybe_add_keyframe(frame_id, image, observations, used_direct, direct_inliers, direct_landmarks, klt_pixel_guesses)
+        if used_direct and self.bootstrap_complete:
+            self._reanchor_klt_to_reprojection(image.shape)
         motion_step_norm = float(np.linalg.norm(self.T_W_C[:3, 3] - self.last_T_W_C[:3, 3]))
         rotation_step_deg = float(np.rad2deg(_rotation_angle(self.last_T_W_C[:3, :3].T @ self.T_W_C[:3, :3])))
         self._update_keyframe_klt_residual_stats(image.shape)
@@ -1435,6 +1440,30 @@ class ExperimentalMonocularVO:
             cov = self._filter_point_covariance(lm)
             if cov is not None:
                 self.mono_map.set_landmark_covariance(int(fid), cov)
+
+    def _reanchor_klt_to_reprojection(self, image_shape: tuple[int, int]) -> None:
+        """Re-seed KLT map-point tracks from the pose-refined reprojection.
+
+        Uses the final pose (post-BA), so tracks re-anchor to the globally-consistent
+        geometry every frame -- an edge point that KLT lets slide is pulled back to
+        where the pose says it must be. Only small slides are corrected.
+        """
+        obs = self._current_observations or {}
+        if not obs or len(self.mono_map) == 0:
+            return
+        tracked_ids = [int(fid) for fid in obs if int(fid) in self.mono_map.landmarks]
+        if not tracked_ids:
+            return
+        points_w = np.asarray([self.mono_map.landmarks[fid].point_w for fid in tracked_ids], dtype=np.float64)
+        uv, _z, visible = self._project_points(self.T_W_C, points_w, image_shape, margin=2)
+        reanchor = {}
+        for i, fid in enumerate(tracked_ids):
+            if not visible[i]:
+                continue
+            if float(np.linalg.norm(uv[i] - np.asarray(obs[fid], dtype=np.float64))) <= self.pnp_reproj_thresh:
+                reanchor[fid] = uv[i]
+        if reanchor:
+            self.feature_tracker.set_positions(reanchor)
 
     def _pnp_from_klt(
         self,

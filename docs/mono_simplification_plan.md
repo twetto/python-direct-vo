@@ -485,7 +485,10 @@ Three **composable** pieces (not either/or, as an earlier draft wrongly implied)
 1. **KLT** — cheap wide-radius guess, seeded from the *prior frame's reprojection*.
 2. **Pose-perturbation photometric refine (epipolar-constrained) + reprojection
    write-back** — corrects the pose AND re-anchors the KLT chain. Kills the ratchet.
-   This is the surgical, cheap edge-drift fix and the recommended next step.
+   **DONE (2026-09-04):** `_reanchor_klt_to_reprojection` +
+   `FeatureTracker.set_positions`, gated by `pnp_reproj_thresh` (re-anchor exactly the
+   points PnP trusts as inliers). Displacement ramp 0.4->2.8px flattened to ~0.1px
+   (no accumulation); ATE 0.078 -> **0.045 m** (official), drift-spread 1.9x.
 3. **Joint BA** — reprojection now; **photometric/DSO** later (poses + affine +
    inverse depths, points 1-DOF on their host ray). Orthogonal accuracy/density
    upgrade; the **Rust `std::arch` AVX2 / PyO3** perf plan lands here.

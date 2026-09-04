@@ -84,6 +84,25 @@ class FeatureTracker:
             for fid, pixel in zip(self.ids, self.prev_points)
         }
 
+    def set_positions(self, positions: dict[int, np.ndarray]) -> int:
+        """Overwrite the tracked pixel of given feature ids (used to re-seed KLT).
+
+        Called after the pose refine to re-anchor map-point tracks to their
+        pose-refined reprojection, so the next frame's KLT starts from the
+        geometrically-correct location instead of its own accumulated edge-drift.
+        """
+        if len(self.ids) == 0 or not positions:
+            return 0
+        id_to_idx = {int(fid): i for i, fid in enumerate(self.ids)}
+        updated = 0
+        for fid, pixel in positions.items():
+            idx = id_to_idx.get(int(fid))
+            if idx is None:
+                continue
+            self.prev_points[idx] = np.asarray(pixel, dtype=np.float32)
+            updated += 1
+        return updated
+
     def remove_ids(self, feature_ids) -> None:
         if len(self.ids) == 0:
             return
