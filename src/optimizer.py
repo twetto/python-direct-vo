@@ -642,7 +642,7 @@ class PhotometricBA:
 
         return {"ran": True, "window": len(keyframes), "edges": len(edges)}
 
-    def optimize_mono_joint_window(self, mono_window, max_nfev=40, max_points=200, prior_reg=1e-6):
+    def optimize_mono_joint_window(self, mono_window, max_nfev=40, max_points=200, prior_reg=1e-6, outlier_reproj_px=4.0):
         """Joint local BA over window poses + covisible points (Phase 3A).
 
         Optimizes keyframe poses (oldest fixed as gauge) and the positions of
@@ -752,9 +752,27 @@ class PhotometricBA:
             keyframes[i + 1].T_W_C = poses[i + 1]
         for j, fid in enumerate(covis):
             mono_map.update_landmark_point(fid, points[j])
+
+        # Multi-view outlier detection: after BA has fit the poses, a point that STILL
+        # reprojects far in several views is geometrically inconsistent (floater) --
+        # transient single-frame spikes cannot survive the multi-view median.
+        outliers = []
+        if n_repro:
+            R_cw = np.stack([np.linalg.inv(T)[:3, :3] for T in poses])
+            t_cw = np.stack([np.linalg.inv(T)[:3, 3] for T in poses])
+            p = np.einsum("eij,ej->ei", R_cw[edge_kf], points[edge_pt]) + t_cw[edge_kf]
+            z = np.clip(p[:, 2], 0.01, None)
+            pu = self.fx * p[:, 0] / z + self.cx
+            pv = self.fy * p[:, 1] / z + self.cy
+            px_err = np.hypot(pu - edge_pixel[:, 0], pv - edge_pixel[:, 1])
+            for j, fid in enumerate(covis):
+                errs = px_err[edge_pt == j]
+                if len(errs) >= 2 and float(np.median(errs)) > outlier_reproj_px:
+                    outliers.append(int(fid))
+
         return {
             "ran": True, "window": len(keyframes), "points": n_pts, "edges": n_repro,
-            "cost_before": cost_before, "cost_after": float(res.cost),
+            "cost_before": cost_before, "cost_after": float(res.cost), "outliers": outliers,
         }
 
     def _visible_mask(self, pts_w, T_W_C, image_shape):

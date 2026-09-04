@@ -897,6 +897,8 @@ class ExperimentalMonocularVO:
             # One joint local BA (poses + covisible points, covariance priors),
             # every keyframe -- replaces the three alternating pose/depth-only BAs.
             self.last_ba_result = self.ba.optimize_mono_joint_window(self.mono_map, max_nfev=40)
+            for fid in self.last_ba_result.get("outliers", []):
+                self.mono_map.remove_landmark(fid)  # multi-view floater/occlusion cull
             if self.last_ba_result.get("ran"):
                 self.T_W_C = self.mono_map.keyframes[-1].T_W_C.copy()
                 self.last_keyframe_pose_update_norm = float(np.linalg.norm(self.T_W_C[:3, 3] - T_before_opt[:3, 3]))

@@ -530,6 +530,21 @@ class MonoMap:
             added += 1
         return added
 
+    def remove_landmark(self, landmark_id: int) -> bool:
+        """Cull a map landmark from every keyframe and the track table (outlier/floater)."""
+        fid = int(landmark_id)
+        removed = self.landmarks.pop(fid, None) is not None
+        for kf in self.keyframes:
+            if len(kf.landmark_ids) and fid in kf.landmark_ids:
+                mask = kf.landmark_ids != fid
+                kf.landmark_ids = kf.landmark_ids[mask]
+                kf.points_w = kf.points_w[mask]
+                kf.intensities = kf.intensities[mask]
+                removed = True
+            kf.features.pop(fid, None)
+            kf.observations.pop(fid, None)
+        return removed
+
     def set_landmark_covariance(self, landmark_id: int, covariance: np.ndarray) -> bool:
         track = self.landmarks.get(int(landmark_id))
         if track is None:
