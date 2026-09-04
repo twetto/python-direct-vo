@@ -26,7 +26,9 @@ class FeatureTracker:
         self.next_id = 0
 
     def update(self, image: np.ndarray, exclusion_points: np.ndarray | None = None) -> dict[int, np.ndarray]:
-        gray = image.astype(np.uint8)
+        # Histogram-equalize before KLT/detection: EuRoC auto-exposure swings otherwise
+        # drift/drop tracks (the stereo path already does this for its LK, main.py).
+        gray = cv2.equalizeHist(image.astype(np.uint8))
 
         if self.prev_img is None:
             self.prev_img = gray.copy()

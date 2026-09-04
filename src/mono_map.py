@@ -36,6 +36,9 @@ class MonoLandmarkTrack:
     n_succeeded_reproj: int = 0
     n_failed_reproj: int = 0
     last_projected_kf_id: int = -1
+    # World-frame 3x3 point covariance carried over from the Sparse3D filter at
+    # promotion (a prior for BA). Large default = "unknown" until a real one is set.
+    point_covariance: np.ndarray = field(default_factory=lambda: np.eye(3) * 1e6)
 
 
 @dataclass
@@ -191,6 +194,87 @@ class MonoMap:
         self.last_inserted = True
         self.last_insert_reason = reason
         return True
+
+    def add_empty_keyframe(
+        self,
+        frame_id: int,
+        image: np.ndarray,
+        T_W_C: np.ndarray,
+        affine_a: float = 0.0,
+        affine_b: float = 0.0,
+        reason: str = "first",
+    ) -> bool:
+        if self.keyframes:
+            self.last_inserted = False
+            self.last_insert_reason = "already_initialized"
+            return False
+        kf = MonoKeyframe(
+            kf_id=self.next_kf_id,
+            frame_id=int(frame_id),
+            image=image.copy(),
+            T_W_C=np.asarray(T_W_C, dtype=np.float64).copy(),
+            affine_a=float(affine_a),
+            affine_b=float(affine_b),
+            landmark_ids=np.empty((0,), dtype=int),
+            points_w=np.empty((0, 3), dtype=np.float64),
+            intensities=np.empty((0, PATTERN_SIZE), dtype=np.float32),
+            insertion_reason=reason,
+            direct_inliers=0,
+            direct_landmarks=0,
+        )
+        self.keyframes.append(kf)
+        self.next_kf_id += 1
+        self.last_inserted = True
+        self.last_insert_reason = reason
+        return True
+
+    def add_landmarks_to_keyframe(
+        self,
+        kf_id: int,
+        landmark_ids: np.ndarray,
+        points_w: np.ndarray,
+        intensities: np.ndarray,
+        observations: dict[int, np.ndarray] | None = None,
+        observation_cov: np.ndarray | None = None,
+    ) -> int:
+        kf = next((item for item in self.keyframes if item.kf_id == int(kf_id)), None)
+        if kf is None:
+            return 0
+        landmark_ids_arr = np.asarray(landmark_ids, dtype=int)
+        points_w_arr = np.asarray(points_w, dtype=np.float64)
+        intensities_arr = np.asarray(intensities, dtype=np.float32)
+        if len(landmark_ids_arr) == 0:
+            return 0
+        if len(landmark_ids_arr) != len(points_w_arr) or len(landmark_ids_arr) != len(intensities_arr):
+            raise ValueError("landmark ids, points, and intensities must have matching lengths")
+
+        existing = {int(fid) for fid in kf.landmark_ids}
+        keep = np.asarray([int(fid) not in existing for fid in landmark_ids_arr], dtype=bool)
+        if not np.any(keep):
+            return 0
+
+        ids = landmark_ids_arr[keep].copy()
+        pts = points_w_arr[keep].copy()
+        ints = intensities_arr[keep].copy()
+        cov = np.eye(2, dtype=np.float64) if observation_cov is None else np.asarray(observation_cov, dtype=np.float64)
+        features, obs_graph = self._make_keyframe_features(
+            int(kf.kf_id),
+            kf.image.shape,
+            kf.T_W_C,
+            ids,
+            pts,
+            ints,
+            observations,
+            cov,
+        )
+
+        kf.landmark_ids = np.concatenate([kf.landmark_ids, ids])
+        kf.points_w = np.vstack([kf.points_w, pts]) if len(kf.points_w) else pts
+        kf.intensities = np.vstack([kf.intensities, ints]) if len(kf.intensities) else ints
+        kf.features.update(features)
+        kf.observations.update(obs_graph)
+        self._add_landmark_observations(kf)
+        return int(len(ids))
 
     def _discard_redundant_keyframe(self) -> None:
         self.last_discarded_kf_id = -1
@@ -403,6 +487,80 @@ class MonoMap:
         for fid in list(self.landmarks):
             if fid not in active_ids:
                 del self.landmarks[fid]
+
+    def add_covisibility_observations(
+        self,
+        kf_id: int,
+        pixel_by_landmark: dict[int, np.ndarray],
+        covariance: np.ndarray | None = None,
+    ) -> int:
+        """Record observations of EXISTING map landmarks in keyframe `kf_id`.
+
+        This is what gives the map covisibility: a landmark hosted in an earlier
+        keyframe gains a second (third, ...) observation here, so bundle adjustment
+        has a real multi-view depth constraint. Pixels come from the tracker's
+        data association (`_keyframe_klt_pixel_guesses`).
+        """
+        kf = next((item for item in self.keyframes if item.kf_id == int(kf_id)), None)
+        if kf is None:
+            return 0
+        cov = np.eye(2, dtype=np.float64) if covariance is None else np.asarray(covariance, dtype=np.float64)
+        hosted = {int(fid) for fid in kf.landmark_ids}
+        added = 0
+        for fid, pixel in pixel_by_landmark.items():
+            fid_i = int(fid)
+            track = self.landmarks.get(fid_i)
+            if track is None or fid_i in hosted or int(kf.kf_id) in track.observations:
+                continue
+            pixel_arr = np.asarray(pixel, dtype=np.float64)
+            kf.observations[fid_i] = MonoObservation(
+                landmark_id=fid_i,
+                pixel=pixel_arr.copy(),
+                point_w=np.asarray(track.point_w, dtype=np.float64).copy(),
+                covariance=cov.copy(),
+            )
+            track.observations[int(kf.kf_id)] = MonoFeature(
+                landmark_id=fid_i,
+                pixel=pixel_arr.copy(),
+                bearing=bearing_from_pixel(pixel_arr, self.K),
+                point_w=np.asarray(track.point_w, dtype=np.float64).copy(),
+                covariance=cov.copy(),
+                host_kf_id=int(track.host_kf_id),
+            )
+            added += 1
+        return added
+
+    def set_landmark_covariance(self, landmark_id: int, covariance: np.ndarray) -> bool:
+        track = self.landmarks.get(int(landmark_id))
+        if track is None:
+            return False
+        track.point_covariance = np.asarray(covariance, dtype=np.float64).copy()
+        return True
+
+    def update_landmark_point(self, landmark_id: int, point_w: np.ndarray) -> bool:
+        fid_i = int(landmark_id)
+        point = np.asarray(point_w, dtype=np.float64).copy()
+        updated = False
+        for kf in self.keyframes:
+            matches = np.where(kf.landmark_ids == fid_i)[0]
+            if len(matches) == 0:
+                continue
+            kf.points_w[matches] = point
+            for idx in matches:
+                if fid_i in kf.observations:
+                    kf.observations[fid_i].point_w = point.copy()
+            feature = kf.features.get(fid_i)
+            if feature is not None:
+                feature.point_w = point.copy()
+            updated = True
+
+        track = self.landmarks.get(fid_i)
+        if track is not None:
+            track.point_w = point.copy()
+            for feature in track.observations.values():
+                feature.point_w = point.copy()
+            updated = True
+        return updated
 
     def direct_references(self, T_W_C: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         self.last_reference_counts = {}

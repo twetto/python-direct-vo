@@ -5,10 +5,10 @@ import numpy as np
 import scipy.ndimage as nd
 
 from src.feature_tracker import FeatureTracker, FeatureTrackerConfig
-from src.landmark_filter import LandmarkStatus, Sparse3DFilterBank, Sparse3DSettings
+from src.landmark_filter import LandmarkStatus, Sparse3DFilterBank, Sparse3DSettings, bearing_from_pixel, two_ray_ranges
 from src.mono_map import MonoMap, MonoMapConfig
 from src.optimizer import PhotometricBA
-from src.tracker import DirectTracker, PATTERN_DX, PATTERN_DY, ensure_pattern_intensities
+from src.tracker import DirectTracker, PATTERN_DX, PATTERN_DY, PATTERN_SIZE, ensure_pattern_intensities
 
 
 @dataclass
@@ -55,6 +55,13 @@ class MonocularVOResult:
     mono_keyframe_klt_residual_p90_px: float
     mono_keyframe_klt_flow_cos_median: float
     mono_keyframe_klt_flow_cos_p10: float
+    mono_svo_match_stats: dict
+    mono_keyframe_reproj_rejected: int
+    mono_keyframe_reproj_median_px: float
+    mono_landmark_updates: int
+    mono_landmark_update_median_m: float
+    mono_landmark_reproj_before_px: float
+    mono_landmark_reproj_after_px: float
     mono_keyframe_pose_update_norm: float
     mono_keyframe_pose_update_rot_deg: float
     mono_direct_candidate_stats: list[dict]
@@ -115,6 +122,7 @@ class ExperimentalMonocularVO:
         self.min_essential_tracks = min_essential_tracks
         self.min_direct_landmarks = min_direct_landmarks
         self.min_direct_inliers = min_direct_inliers
+        self.initial_keyframe_min_landmarks = max(self.min_direct_landmarks * 3, self.mono_map.config.min_keyframe_landmarks)
         self.image_motion_fallback_depth = image_motion_fallback_depth
         self.max_bootstrap_step = max_bootstrap_step
         self.max_rotation_step_rad = np.deg2rad(max_rotation_step_deg)
@@ -128,6 +136,9 @@ class ExperimentalMonocularVO:
         self.last_direct_delta = np.eye(4)
         self.have_direct_motion_model = False
         self.prev_observations: dict[int, np.ndarray] = {}
+        self._current_observations: dict[int, np.ndarray] = {}
+        self.bootstrap_anchor_observations: dict[int, np.ndarray] = {}
+        self.bootstrap_anchor_kf_id: int | None = None
         self.current_a = 0.0
         self.current_b = 0.0
         self.last_essential_common_tracks = 0
@@ -162,11 +173,19 @@ class ExperimentalMonocularVO:
         self.last_keyframe_klt_flow_cos_p10 = 0.0
         self.last_keyframe_pose_update_norm = 0.0
         self.last_keyframe_pose_update_rot_deg = 0.0
+        self.last_keyframe_reproj_rejected = 0
+        self.last_keyframe_reproj_median_px = 0.0
+        self.last_landmark_updates = 0
+        self.last_landmark_update_median_m = 0.0
+        self.last_landmark_reproj_before_px = 0.0
+        self.last_landmark_reproj_after_px = 0.0
         self.min_keyframe_klt_flow_cos = 0.2
         self.min_keyframe_klt_flow_gate_tracks = 50
         self.candidate_klt_residual_gate_tracks = 50
         self.candidate_klt_median_good_px = 1.0
         self.candidate_klt_p90_good_px = 3.0
+        self.candidate_klt_median_reject_px = 5.0
+        self.candidate_klt_p90_reject_px = 12.0
         self.candidate_klt_median_penalty = 5.0
         self.candidate_klt_p90_penalty = 1.0
         self.direct_prefilter_abs_threshold = 45.0
@@ -175,80 +194,133 @@ class ExperimentalMonocularVO:
         self.last_direct_prefilter_kept = 0
         self.last_direct_prefilter_rejected = 0
         self.last_frame_observations: dict[int, MonoFrameObservation] = {}
+        self.last_svo_match_stats = self._empty_svo_match_stats("not_run")
         self.patch_match_search_radius = 2
-        self.patch_match_max_error = 45.0
+        self.patch_match_max_error = 35.0
+        self.matched_pose_min_inlier_ratio = 0.55
+        self.matched_pose_min_inliers = max(24, self.min_direct_inliers)
+        self.matched_pose_max_median_residual_px = 1.2
+        self.matched_pose_max_p90_residual_px = 3.0
+        self.matched_pose_max_median_patch_error = 18.0
+        self.matched_pose_max_p90_patch_error = 35.0
+        self.matched_pose_min_flow_cos = 0.45
+        self.matched_pose_min_flow_gate_tracks = 50
+        self.first_keyframe_max_reprojection_error_px = 1.5
+        self.max_bootstrap_anchor_rotation_rad = np.deg2rad(45.0)
+        # Two-view bootstrap gates (Phase 1: scale fixed once by triangulation).
+        # Aligned with SVO Pro's initialization contract (svo/src/initialization.cpp):
+        # gate on MEDIAN feature disparity (their init_min_disparity, = 30 px in the
+        # EuRoC configs), then require an init_min_inliers-style triangulated floor.
+        # At marginal parallax the correspondences simply do not triangulate, so
+        # both SVO and DSO refuse to initialize there rather than seeking more points.
+        self.bootstrap_min_flow_px = 30.0
+        self.bootstrap_min_parallax_deg = 2.0
+        self.bootstrap_min_triangulated = max(int(self.min_essential_tracks), 40)
+        # Stage 1 (DSO-style pure-Gaussian depth): promote a filter landmark into the
+        # VO map once it has real anchor->current parallax, using the filter's own
+        # (birth-triangulated, recursively refined) depth -- one estimator, not two.
+        # KLT outlier rejection is already handled upstream by FeatureTracker's RANSAC.
+        self.map_promotion_min_parallax_deg = 5.0
+        # Scale-invariant keyframing (SVO needNewKf, frame_handler_base.cpp). Metric
+        # motion is unusable in an under-scaled mono frame; pixel disparity vs the last
+        # keyframe and tracked-landmark count are scale-invariant. EuRoC values from
+        # svo exp_euroc_nolc.yaml (kfselect_min_disparity 40, lower_thresh 100).
+        self.kf_min_disparity_px = 40.0
+        self.kf_min_tracked_landmarks = 60
+        self.kf_min_frames_between = 2
+        # Pose = PnP-RANSAC from the reliable KLT map-point correspondences (an
+        # absolute, drift-free anchor), then direct photometric refinement seeded from
+        # it. Replaces the drifting motion-model / candidate-selection soup.
+        self.pnp_min_correspondences = 12
+        self.pnp_reproj_thresh = 3.0
+        self.pnp_min_inliers = 12
+        self.landmark_update_max_reprojection_px = 8.0
+        self.landmark_update_min_parallax_sin = 0.003
+        self.landmark_update_max_abs_log_range = 0.06
 
     def process(self, frame_id: int, image: np.ndarray) -> MonocularVOResult:
+        self.last_keyframe_inserted = False
+        self.last_keyframe_reason = ""
+        self.last_keyframe_reproj_rejected = 0
+        self.last_keyframe_reproj_median_px = 0.0
+        self.last_landmark_updates = 0
+        self.last_landmark_update_median_m = 0.0
+        self.last_landmark_reproj_before_px = 0.0
+        self.last_landmark_reproj_after_px = 0.0
         exclusion_points = self._project_existing_map_landmarks(image.shape)
         self.last_gftt_exclusions = len(exclusion_points)
         observations = self.feature_tracker.update(image, exclusion_points=exclusion_points)
+        self._current_observations = observations
+        seeded_sparse_depth = self._ensure_first_keyframe(frame_id, image, observations)
 
         image_motion_fallback_used = False
         motion_source = "hold"
-        if self.bootstrap_complete:
+
+        # --- Bootstrap: a single two-view triangulation that fixes scale once ---
+        # (Phase 1) The map is initialized in one step from anchor<->current
+        # essential + triangulation, with median scene depth normalized to 1.0.
+        # No assumed-depth / flow-scaled magnitude is ever injected.
+        bootstrapped = False
+        if not self.bootstrap_complete:
             self._reset_essential_diagnostics(observations)
-            T_W_C_guess = self.T_W_C.copy()
-        else:
-            T_W_C_guess = self._essential_pose_guess(observations)
-            if T_W_C_guess is not None:
-                motion_source = "essential_bootstrap"
-            if T_W_C_guess is None:
-                T_W_C_guess = self._image_motion_pose_guess(observations)
-                image_motion_fallback_used = T_W_C_guess is not None
-                if image_motion_fallback_used:
-                    motion_source = "flow_bootstrap"
-        if T_W_C_guess is None:
-            T_W_C_guess = self.T_W_C.copy()
+            if not seeded_sparse_depth:
+                bootstrapped = self._try_two_view_bootstrap(frame_id, image, observations)
+            if bootstrapped:
+                motion_source = "two_view_bootstrap"
 
         used_direct = False
         direct_inliers = 0
         direct_landmarks = 0
         direct_attempted = False
         direct_hypotheses = 0
-        direct_guesses = [("direct_bootstrap", T_W_C_guess)]
-        if self.bootstrap_complete:
-            direct_guesses = self._direct_pose_guesses()
-            visible_refs = self.mono_map.visible_references(T_W_C_guess, image.shape)
+        visible_refs = []
+        klt_pixel_guesses = {}
+        best = {"candidates": []}
+        if self.bootstrap_complete and not bootstrapped:
+            self._reset_essential_diagnostics(observations)
+            self.last_svo_match_stats = self._empty_svo_match_stats("klt_pnp")
+            old_T_W_C = self.T_W_C.copy()
+            visible_refs = self.mono_map.visible_references(self.T_W_C, image.shape)
             klt_pixel_guesses = self._keyframe_klt_pixel_guesses(image, visible_refs)
-            matched_guess = self._matched_observation_pose_guess(image, T_W_C_guess, visible_refs, klt_pixel_guesses)
-            if matched_guess is not None:
-                direct_guesses = [("svo_match", matched_guess)] + direct_guesses
-
-        old_T_W_C = self.T_W_C.copy()
-        best = self._track_direct_candidates(image, direct_guesses)
-        direct_hypotheses = best["hypotheses"]
-        direct_landmarks = best["landmarks"]
-        direct_attempted = best["attempted"]
-        direct_inliers = best["inliers"]
-        if best["accepted"]:
-            self.T_W_C = best["T_W_C"]
-            self.current_a = best["a"]
-            self.current_b = best["b"]
-            self.last_direct_delta = np.linalg.inv(old_T_W_C) @ self.T_W_C
-            self.have_direct_motion_model = True
-            used_direct = True
-            motion_source = best["source"]
-            self.last_keyframe_klt_used = best["source"] in {"keyframe_klt", "svo_match"}
-        else:
-            self.last_keyframe_klt_used = False
-            if self.bootstrap_complete:
-                self.T_W_C = old_T_W_C
+            # 1) Absolute pose from the reliable KLT 2D-3D correspondences (drift-free).
+            T_C_W_pnp, pnp_inliers = self._pnp_from_klt(visible_refs, klt_pixel_guesses)
+            if T_C_W_pnp is not None:
+                direct_attempted = True
+                # 2) Direct photometric refinement seeded from the PnP pose.
+                pts_w, ints, a_ref, b_ref, ids = self.mono_map.direct_references(np.linalg.inv(T_C_W_pnp))
+                direct_landmarks = int(len(pts_w))
+                if len(pts_w) >= self.min_direct_landmarks:
+                    T_C_W_out, inl, a_opt, b_opt = self.direct_tracker.track_map(
+                        image, pts_w, ints, a_ref, b_ref, T_C_W_pnp,
+                        self.current_a, self.current_b, max_iters=10,
+                    )
+                    self.T_W_C = np.linalg.inv(T_C_W_out)
+                    self.current_a = a_opt
+                    self.current_b = b_opt
+                    direct_inliers = int(np.sum(inl))
+                else:
+                    self.T_W_C = np.linalg.inv(T_C_W_pnp)  # too few map refs; trust PnP
+                    direct_inliers = int(pnp_inliers)
+                self.last_direct_delta = np.linalg.inv(old_T_W_C) @ self.T_W_C
+                self.have_direct_motion_model = True
+                self.last_keyframe_klt_used = True
+                used_direct = True
+                motion_source = "klt_pnp_direct"
             else:
-                self.T_W_C = T_W_C_guess
+                self.last_keyframe_klt_used = False
+                self.T_W_C = old_T_W_C
+                motion_source = "hold"
+        elif not bootstrapped:
+            self.last_svo_match_stats = self._empty_svo_match_stats("bootstrap")
 
-        if used_direct and direct_inliers >= self.min_direct_inliers:
-            self.bootstrap_complete = True
-        elif not self.bootstrap_complete and direct_landmarks >= self.min_direct_landmarks * 2:
-            self.bootstrap_complete = True
-
-        if not self.bootstrap_complete or used_direct:
-            self.sparse3d.update(
-                frame_id,
-                observations,
-                self.T_W_C,
-                remove_missing=not self.bootstrap_complete,
-            )
-        self._maybe_add_keyframe(frame_id, image, observations, used_direct, direct_inliers, direct_landmarks)
+        # Post-bootstrap: keep Sparse3D refining depths for future keyframes.
+        # (KLT tracks are already fundamental-RANSAC filtered inside FeatureTracker.)
+        if used_direct and self.bootstrap_complete:
+            self.sparse3d.update(frame_id, observations, self.T_W_C, remove_missing=False)
+        if used_direct and len(self.mono_map) > 0 and visible_refs and klt_pixel_guesses:
+            self._update_map_landmarks_from_klt(image.shape, visible_refs, klt_pixel_guesses, self.T_W_C)
+        if not self.last_keyframe_inserted:
+            self._maybe_add_keyframe(frame_id, image, observations, used_direct, direct_inliers, direct_landmarks, klt_pixel_guesses)
         motion_step_norm = float(np.linalg.norm(self.T_W_C[:3, 3] - self.last_T_W_C[:3, 3]))
         rotation_step_deg = float(np.rad2deg(_rotation_angle(self.last_T_W_C[:3, :3].T @ self.T_W_C[:3, :3])))
         self._update_keyframe_klt_residual_stats(image.shape)
@@ -297,6 +369,13 @@ class ExperimentalMonocularVO:
             mono_keyframe_klt_residual_p90_px=self.last_keyframe_klt_residual_p90_px,
             mono_keyframe_klt_flow_cos_median=self.last_keyframe_klt_flow_cos_median,
             mono_keyframe_klt_flow_cos_p10=self.last_keyframe_klt_flow_cos_p10,
+            mono_svo_match_stats=dict(self.last_svo_match_stats),
+            mono_keyframe_reproj_rejected=int(self.last_keyframe_reproj_rejected),
+            mono_keyframe_reproj_median_px=float(self.last_keyframe_reproj_median_px),
+            mono_landmark_updates=int(self.last_landmark_updates),
+            mono_landmark_update_median_m=float(self.last_landmark_update_median_m),
+            mono_landmark_reproj_before_px=float(self.last_landmark_reproj_before_px),
+            mono_landmark_reproj_after_px=float(self.last_landmark_reproj_after_px),
             mono_keyframe_pose_update_norm=self.last_keyframe_pose_update_norm,
             mono_keyframe_pose_update_rot_deg=self.last_keyframe_pose_update_rot_deg,
             mono_direct_candidate_stats=best.get("candidates", []),
@@ -312,59 +391,79 @@ class ExperimentalMonocularVO:
             mono_keyframe_discard_reason=str(self.mono_map.last_discard_reason),
         )
 
+    def _ensure_first_keyframe(
+        self,
+        frame_id: int,
+        image: np.ndarray,
+        observations: dict[int, np.ndarray],
+    ) -> bool:
+        if len(self.mono_map) > 0:
+            return False
+        inserted = self.mono_map.add_empty_keyframe(
+            frame_id,
+            image,
+            self.T_W_C,
+            self.current_a,
+            self.current_b,
+            reason="first",
+        )
+        if not inserted:
+            return False
+        self.bootstrap_anchor_kf_id = int(self.mono_map.keyframes[0].kf_id)
+        self.bootstrap_anchor_observations = {
+            int(fid): np.asarray(pixel, dtype=np.float64).copy()
+            for fid, pixel in observations.items()
+        }
+        self.sparse3d.update(frame_id, observations, self.T_W_C, remove_missing=True)
+        self.last_keyframe_inserted = True
+        self.last_keyframe_reason = self.mono_map.last_insert_reason
+        return True
+
     def _keyframe_klt_pose_guess(self, image: np.ndarray) -> np.ndarray | None:
         refs = self.mono_map.visible_references(self.T_W_C, image.shape)
         pixel_guesses = self._keyframe_klt_pixel_guesses(image, refs)
         return self._matched_observation_pose_guess(image, self.T_W_C, refs, pixel_guesses)
 
     def _keyframe_klt_pixel_guesses(self, image: np.ndarray, refs: list[dict]) -> dict[int, np.ndarray]:
+        """Associate visible map points with their persistent KLT observation.
+
+        Map points keep their FeatureTracker track after promotion (not retired), so
+        each one's current pixel is read directly from the tracker's observations --
+        a real frame-to-frame track, not a per-frame re-projection through the pose.
+        """
         self.last_keyframe_klt_tracks = 0
         self.last_keyframe_klt_inliers = 0
         self.last_keyframe_klt_points_w = np.empty((0, 3), dtype=np.float64)
         self.last_keyframe_klt_prev_pixels = np.empty((0, 2), dtype=np.float64)
         self.last_keyframe_klt_pixels = np.empty((0, 2), dtype=np.float64)
-        prev_img = self.feature_tracker.prev_img
-        if prev_img is None or not refs:
+        if not refs:
             return {}
 
-        pts_w_all = np.asarray([ref["point_w"] for ref in refs], dtype=np.float64)
-        landmark_ids = np.asarray([ref["landmark_id"] for ref in refs], dtype=int)
-        prev_uv, _, visible = self._project_points(self.T_W_C, pts_w_all, image.shape, margin=4)
-        if np.sum(visible) < 8:
-            return {}
-
-        ids = landmark_ids[visible]
-        pts_w = pts_w_all[visible].astype(np.float64)
-        p0 = prev_uv[visible].astype(np.float32)
-        p1, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_img.astype(np.uint8),
-            image.astype(np.uint8),
-            p0.reshape(-1, 1, 2),
-            None,
-            winSize=(21, 21),
-            maxLevel=3,
-        )
-        if p1 is None or status is None:
-            return {}
-
-        p1 = p1.reshape(-1, 2)
-        good = status.reshape(-1).astype(bool)
+        obs = self._current_observations or {}
+        prev = self.prev_observations or {}
         h, w = image.shape
-        good &= (p1[:, 0] >= 2) & (p1[:, 0] < w - 2)
-        good &= (p1[:, 1] >= 2) & (p1[:, 1] < h - 2)
-        self.last_keyframe_klt_tracks = int(np.sum(good))
-        if np.sum(good) < 8:
-            return {}
+        guesses = {}
+        points_w, prev_px, cur_px, ids = [], [], [], []
+        for ref in refs:
+            fid = int(ref["landmark_id"])
+            cur = obs.get(fid)
+            if cur is None:
+                continue  # map point is not currently tracked by the KLT front-end
+            cur = np.asarray(cur, dtype=np.float64)
+            if cur[0] < 2 or cur[0] >= w - 2 or cur[1] < 2 or cur[1] >= h - 2:
+                continue
+            guesses[fid] = cur.copy()
+            points_w.append(ref["point_w"])
+            cur_px.append(cur)
+            prev_px.append(np.asarray(prev.get(fid, cur), dtype=np.float64))
+            ids.append(fid)
 
-        tracked_points_w = pts_w[good]
-        tracked_prev_pixels = p0[good].astype(np.float64)
-        tracked_pixels = p1[good].astype(np.float64)
-        tracked_ids = ids[good].astype(int)
-
-        self.last_keyframe_klt_points_w = tracked_points_w
-        self.last_keyframe_klt_prev_pixels = tracked_prev_pixels
-        self.last_keyframe_klt_pixels = tracked_pixels
-        return {int(fid): pixel.copy() for fid, pixel in zip(tracked_ids, tracked_pixels)}
+        self.last_keyframe_klt_tracks = len(ids)
+        if ids:
+            self.last_keyframe_klt_points_w = np.asarray(points_w, dtype=np.float64)
+            self.last_keyframe_klt_prev_pixels = np.asarray(prev_px, dtype=np.float64)
+            self.last_keyframe_klt_pixels = np.asarray(cur_px, dtype=np.float64)
+        return guesses
 
     def _matched_observation_pose_guess(
         self,
@@ -375,13 +474,28 @@ class ExperimentalMonocularVO:
     ) -> np.ndarray | None:
         matched = self._match_visible_reference_patches(image, refs, pixel_guesses)
         accepted = [obs for obs in matched.values() if obs.accepted]
+        self.last_svo_match_stats = {
+            "reason": "not_evaluated",
+            "visible_refs": int(len(refs)),
+            "klt_pixel_guesses": int(len(pixel_guesses)),
+            "patch_matches": int(len(accepted)),
+            "pnp_inliers": 0,
+            "pnp_inlier_ratio": 0.0,
+            "patch_median_error": float(np.median([obs.photometric_error for obs in accepted])) if accepted else 0.0,
+            "patch_p90_error": float(np.percentile([obs.photometric_error for obs in accepted], 90)) if accepted else 0.0,
+            "residual_median_px": 0.0,
+            "residual_p90_px": 0.0,
+            "flow_cos_median": 0.0,
+        }
         self.last_frame_observations = matched
         self.last_keyframe_klt_inliers = len(accepted)
-        if len(accepted) < max(12, self.min_direct_inliers // 2):
+        if len(accepted) < self.matched_pose_min_inliers:
+            self.last_svo_match_stats["reason"] = "too_few_patch_matches"
             return None
 
         points_w = np.asarray([obs.point_w for obs in accepted], dtype=np.float64)
         pixels = np.asarray([obs.matched_pixel for obs in accepted], dtype=np.float64)
+        patch_errors = np.asarray([obs.photometric_error for obs in accepted], dtype=np.float64)
 
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
             points_w,
@@ -394,15 +508,29 @@ class ExperimentalMonocularVO:
             flags=cv2.SOLVEPNP_EPNP,
         )
         if not success or inliers is None:
+            self.last_svo_match_stats["reason"] = "pnp_failed"
             return None
 
         self.last_keyframe_klt_inliers = int(len(inliers))
-        if len(inliers) < max(12, self.min_direct_inliers // 2):
+        self.last_svo_match_stats["pnp_inliers"] = int(len(inliers))
+        self.last_svo_match_stats["pnp_inlier_ratio"] = float(len(inliers)) / float(len(accepted))
+        if len(inliers) < self.matched_pose_min_inliers:
+            self.last_svo_match_stats["reason"] = "too_few_pnp_inliers"
+            return None
+        if float(len(inliers)) / float(len(accepted)) < self.matched_pose_min_inlier_ratio:
+            self.last_svo_match_stats["reason"] = "low_pnp_inlier_ratio"
             return None
         inlier_idx = inliers.reshape(-1)
         self.last_keyframe_klt_points_w = points_w[inlier_idx].astype(np.float64)
         self.last_keyframe_klt_prev_pixels = np.asarray([obs.initial_pixel for obs in accepted], dtype=np.float64)[inlier_idx]
         self.last_keyframe_klt_pixels = pixels[inlier_idx].astype(np.float64)
+        inlier_patch_errors = patch_errors[inlier_idx]
+        if (
+            float(np.median(inlier_patch_errors)) > self.matched_pose_max_median_patch_error
+            or float(np.percentile(inlier_patch_errors, 90)) > self.matched_pose_max_p90_patch_error
+        ):
+            self.last_svo_match_stats["reason"] = "high_patch_error"
+            return None
 
         R_C_W, _ = cv2.Rodrigues(rvec)
         T_C_W = np.eye(4, dtype=np.float64)
@@ -410,8 +538,45 @@ class ExperimentalMonocularVO:
         T_C_W[:3, 3] = tvec.reshape(3)
         T_W_C = np.linalg.inv(T_C_W)
         if not self._direct_step_is_plausible(T_W_C):
+            self.last_svo_match_stats["reason"] = "implausible_step"
             return None
+        residual_stats = self._keyframe_klt_residual_stats_for_pose(T_W_C, image.shape)
+        self.last_svo_match_stats["residual_median_px"] = float(residual_stats["median"])
+        self.last_svo_match_stats["residual_p90_px"] = float(residual_stats["p90"])
+        if (
+            residual_stats["count"] >= self.candidate_klt_residual_gate_tracks
+            and (
+                residual_stats["median"] > self.matched_pose_max_median_residual_px
+                or residual_stats["p90"] > self.matched_pose_max_p90_residual_px
+            )
+        ):
+            self.last_svo_match_stats["reason"] = "high_reprojection_residual"
+            return None
+        flow_stats = self._keyframe_klt_flow_stats_for_pose(T_W_C, image.shape)
+        self.last_svo_match_stats["flow_cos_median"] = float(flow_stats["median"])
+        if (
+            flow_stats["count"] >= self.matched_pose_min_flow_gate_tracks
+            and flow_stats["median"] < self.matched_pose_min_flow_cos
+        ):
+            self.last_svo_match_stats["reason"] = "inconsistent_flow_direction"
+            return None
+        self.last_svo_match_stats["reason"] = "accepted"
         return T_W_C
+
+    def _empty_svo_match_stats(self, reason: str) -> dict:
+        return {
+            "reason": reason,
+            "visible_refs": 0,
+            "klt_pixel_guesses": 0,
+            "patch_matches": 0,
+            "pnp_inliers": 0,
+            "pnp_inlier_ratio": 0.0,
+            "patch_median_error": 0.0,
+            "patch_p90_error": 0.0,
+            "residual_median_px": 0.0,
+            "residual_p90_px": 0.0,
+            "flow_cos_median": 0.0,
+        }
 
     def _match_visible_reference_patches(
         self,
@@ -637,6 +802,7 @@ class ExperimentalMonocularVO:
         used_direct: bool,
         direct_inliers: int,
         direct_landmarks: int,
+        klt_pixel_guesses: dict[int, np.ndarray] | None = None,
     ) -> None:
         self.last_keyframe_inserted = False
         self.last_keyframe_reason = ""
@@ -658,22 +824,22 @@ class ExperimentalMonocularVO:
         if not self.bootstrap_complete or not used_direct:
             return
 
-        should_insert, reason = self.mono_map.should_insert(
-            self.T_W_C,
-            direct_inliers,
-            direct_landmarks,
-            self.min_direct_landmarks,
-            force_first=len(self.mono_map) == 0,
-        )
+        should_insert, reason = self._needs_keyframe(frame_id, klt_pixel_guesses, direct_landmarks)
         if not should_insert:
             return
 
+        # One estimator: use the filter's own (birth-triangulated, refined) depth, and
+        # gate promotion on geometric parallax rather than EKF convergence -- the
+        # convergence gate lagged camera motion and froze the map (plan Phase 3B).
         pts_w, intensities, _, _, ids = self.sparse3d.mature_landmarks(
             self.T_W_C,
             image,
             affine_a=self.current_a,
             affine_b=self.current_b,
+            require_converged=False,
         )
+        keep = self._map_promotion_parallax_mask(pts_w, ids)
+        pts_w, intensities, ids = pts_w[keep], intensities[keep], ids[keep]
         inserted = self.mono_map.add_keyframe(
             frame_id,
             image,
@@ -691,24 +857,233 @@ class ExperimentalMonocularVO:
         )
         self.last_keyframe_inserted = inserted
         self.last_keyframe_reason = self.mono_map.last_insert_reason
+        if inserted:
+            # Carry the filter's uncertainty into the map BEFORE retiring the filters.
+            self._store_promotion_covariances(ids)
+            # Record covisibility: existing map points tracked into this frame gain a
+            # new observation here, giving BA real multi-view depth constraints.
+            if klt_pixel_guesses:
+                self.mono_map.add_covisibility_observations(
+                    self.mono_map.keyframes[-1].kf_id,
+                    klt_pixel_guesses,
+                    covariance=np.eye(2) * self.sparse3d.settings.sigma_pixel * self.sparse3d.settings.sigma_pixel,
+                )
         if inserted and len(self.mono_map) >= 2:
             T_before_opt = self.T_W_C.copy()
+            # Retire the depth filter (BA owns depth now) but KEEP the KLT track: the
+            # map point must stay tracked by the front-end for covisibility/tracking.
             self.sparse3d.retire(ids)
-            self.feature_tracker.remove_ids(ids)
-            self.keyframes_since_ba += 1
-            should_run_ba = self.keyframes_since_ba >= self.ba_every_keyframes or reason == "low_inlier_ratio"
-            if should_run_ba:
-                self.last_geo_ba_result = self.ba.optimize_mono_geometric_pose_window(self.mono_map, max_iters=3)
-                self.last_depth_ba_result = self.ba.optimize_mono_inverse_depth_window(self.mono_map, max_iters=3)
-                self.last_ba_result = self.ba.optimize_mono_pose_window(self.mono_map, max_iters=1)
-                self.keyframes_since_ba = 0
+            # One joint local BA (poses + covisible points, covariance priors),
+            # every keyframe -- replaces the three alternating pose/depth-only BAs.
+            self.last_ba_result = self.ba.optimize_mono_joint_window(self.mono_map, max_nfev=40)
+            if self.last_ba_result.get("ran"):
                 self.T_W_C = self.mono_map.keyframes[-1].T_W_C.copy()
                 self.last_keyframe_pose_update_norm = float(np.linalg.norm(self.T_W_C[:3, 3] - T_before_opt[:3, 3]))
                 self.last_keyframe_pose_update_rot_deg = float(np.rad2deg(_rotation_angle(T_before_opt[:3, :3].T @ self.T_W_C[:3, :3])))
                 self.last_direct_delta = np.linalg.inv(self.last_T_W_C) @ self.T_W_C
         elif inserted:
             self.sparse3d.retire(ids)
+
+    def _maybe_add_initial_keyframe(
+        self,
+        frame_id: int,
+        image: np.ndarray,
+        observations: dict[int, np.ndarray],
+    ) -> None:
+        if self.bootstrap_complete or len(self.mono_map) == 0:
+            return
+        host_kf = self.mono_map.keyframes[0]
+        initial_landmark_target = int(self.initial_keyframe_min_landmarks)
+        if len(host_kf.landmark_ids) >= initial_landmark_target:
+            self.bootstrap_complete = True
+            return
+        self.last_keyframe_inserted = False
+        self.last_keyframe_reason = ""
+        pts_w, intensities, ids, host_observations = self._initial_keyframe_landmarks(host_kf, observations)
+        if len(ids) == 0:
+            return
+        added = self.mono_map.add_landmarks_to_keyframe(
+            host_kf.kf_id,
+            ids,
+            pts_w,
+            intensities,
+            observations=host_observations,
+            observation_cov=np.eye(2) * self.sparse3d.settings.sigma_pixel * self.sparse3d.settings.sigma_pixel,
+        )
+        self.last_keyframe_inserted = added > 0
+        self.last_keyframe_reason = "bootstrap_landmarks" if added > 0 else ""
+        if added > 0 and len(host_kf.landmark_ids) >= initial_landmark_target:
+            self.bootstrap_complete = True
+            self.sparse3d.retire(ids)
             self.feature_tracker.remove_ids(ids)
+            self.have_direct_motion_model = False
+            self.last_direct_delta = np.eye(4)
+
+    def _initial_keyframe_landmarks(
+        self,
+        host_kf,
+        observations: dict[int, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, np.ndarray]]:
+        points_w = []
+        intensities = []
+        ids = []
+        host_observations = {}
+        residuals = []
+        rejected = 0
+        image_f = host_kf.image.astype(np.float32)
+        h, w = host_kf.image.shape
+        T_C_W = np.linalg.inv(self.T_W_C)
+        max_error = float(self.first_keyframe_max_reprojection_error_px)
+        for fid, lm in self.sparse3d.features.items():
+            fid_i = int(fid)
+            if int(lm.anchor_frame_id) != int(host_kf.frame_id):
+                rejected += 1
+                continue
+            observed = observations.get(fid_i)
+            if observed is None:
+                rejected += 1
+                continue
+            try:
+                point_w = lm.anchor_T_W_C[:3, :3] @ lm.anchor_point() + lm.anchor_T_W_C[:3, 3]
+            except ValueError:
+                rejected += 1
+                continue
+            point_c = T_C_W[:3, :3] @ point_w + T_C_W[:3, 3]
+            if point_c[2] <= 0.01:
+                rejected += 1
+                continue
+            projected = np.array([
+                self.K[0, 0] * point_c[0] / point_c[2] + self.K[0, 2],
+                self.K[1, 1] * point_c[1] / point_c[2] + self.K[1, 2],
+            ])
+            observed = np.asarray(observed, dtype=np.float64)
+            error = float(np.linalg.norm(projected - observed))
+            if not np.isfinite(error) or error > max_error:
+                rejected += 1
+                continue
+            host_pixel = self._pixel_from_bearing(lm.anchor_bearing)
+            if host_pixel[0] < 2 or host_pixel[0] >= w - 2 or host_pixel[1] < 2 or host_pixel[1] >= h - 2:
+                rejected += 1
+                continue
+            patch = nd.map_coordinates(
+                image_f,
+                [host_pixel[1] + PATTERN_DY, host_pixel[0] + PATTERN_DX],
+                order=1,
+            ).astype(np.float32)
+            points_w.append(point_w)
+            intensities.append(patch)
+            ids.append(fid_i)
+            host_observations[fid_i] = host_pixel
+            residuals.append(error)
+
+        self.last_keyframe_reproj_rejected = int(rejected)
+        self.last_keyframe_reproj_median_px = float(np.median(residuals)) if residuals else 0.0
+        if not ids:
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, PATTERN_SIZE), dtype=np.float32),
+                np.empty((0,), dtype=int),
+                {},
+            )
+        return (
+            np.asarray(points_w, dtype=np.float64),
+            np.asarray(intensities, dtype=np.float32),
+            np.asarray(ids, dtype=int),
+            host_observations,
+        )
+
+    def _update_map_landmarks_from_klt(
+        self,
+        image_shape: tuple[int, int],
+        refs: list[dict],
+        pixel_guesses: dict[int, np.ndarray],
+        T_W_C_observe: np.ndarray | None = None,
+    ) -> None:
+        if not refs or not pixel_guesses or len(self.mono_map) == 0:
+            return
+
+        T_W_C_obs = self.T_W_C if T_W_C_observe is None else np.asarray(T_W_C_observe, dtype=np.float64)
+        keyframes_by_id = {int(kf.kf_id): kf for kf in self.mono_map.keyframes}
+        before_errors = []
+        after_errors = []
+        update_norms = []
+        h, w = image_shape
+        max_reproj = float(self.landmark_update_max_reprojection_px)
+        max_log = float(self.landmark_update_max_abs_log_range)
+        for ref in refs:
+            fid = int(ref["landmark_id"])
+            observed = pixel_guesses.get(fid)
+            if observed is None:
+                continue
+            observed = np.asarray(observed, dtype=np.float64)
+            if observed[0] < 2 or observed[0] >= w - 2 or observed[1] < 2 or observed[1] >= h - 2:
+                continue
+
+            matched_obs = self.last_frame_observations.get(fid)
+            if matched_obs is not None and not matched_obs.accepted:
+                continue
+
+            host_kf = keyframes_by_id.get(int(ref["host_kf_id"]))
+            if host_kf is None:
+                continue
+            host_pixel = np.asarray(ref["host_pixel"], dtype=np.float64)
+            old_point = np.asarray(ref["point_w"], dtype=np.float64)
+            projected, _depths, visible = self._project_points(T_W_C_obs, old_point.reshape(1, 3), image_shape)
+            if not bool(visible[0]):
+                continue
+            before_error = float(np.linalg.norm(projected[0] - observed))
+            if not np.isfinite(before_error) or before_error > max_reproj:
+                continue
+
+            b_host = bearing_from_pixel(host_pixel, self.K)
+            b_current = bearing_from_pixel(observed, self.K)
+            T_H_C = np.linalg.inv(host_kf.T_W_C) @ T_W_C_obs
+            R_H_C = T_H_C[:3, :3]
+            t_H_C = T_H_C[:3, 3]
+            if np.linalg.norm(np.cross(b_host, R_H_C @ b_current)) < self.landmark_update_min_parallax_sin:
+                continue
+            ranges = two_ray_ranges(b_host, b_current, R_H_C, t_H_C)
+            if ranges is None:
+                continue
+            host_range, current_range = ranges
+            if (
+                not np.isfinite(host_range)
+                or not np.isfinite(current_range)
+                or host_range < self.sparse3d.settings.min_depth
+                or current_range < self.sparse3d.settings.min_depth
+                or host_range > self.sparse3d.settings.max_depth
+                or current_range > self.sparse3d.settings.max_depth
+            ):
+                continue
+
+            old_host = np.linalg.inv(host_kf.T_W_C)[:3, :3] @ old_point + np.linalg.inv(host_kf.T_W_C)[:3, 3]
+            old_range = float(np.linalg.norm(old_host))
+            if old_range <= 1e-9:
+                continue
+            log_update = float(np.clip(np.log(host_range / old_range), -max_log, max_log))
+            refined_range = old_range * np.exp(log_update)
+            refined_host = b_host * refined_range
+            refined_point = host_kf.T_W_C[:3, :3] @ refined_host + host_kf.T_W_C[:3, 3]
+
+            refined_projected, _depths, refined_visible = self._project_points(
+                T_W_C_obs,
+                refined_point.reshape(1, 3),
+                image_shape,
+            )
+            if not bool(refined_visible[0]):
+                continue
+            after_error = float(np.linalg.norm(refined_projected[0] - observed))
+            if not np.isfinite(after_error) or after_error > before_error:
+                continue
+            if self.mono_map.update_landmark_point(fid, refined_point):
+                before_errors.append(before_error)
+                after_errors.append(after_error)
+                update_norms.append(float(np.linalg.norm(refined_point - old_point)))
+
+        self.last_landmark_updates = int(len(update_norms))
+        self.last_landmark_update_median_m = float(np.median(update_norms)) if update_norms else 0.0
+        self.last_landmark_reproj_before_px = float(np.median(before_errors)) if before_errors else 0.0
+        self.last_landmark_reproj_after_px = float(np.median(after_errors)) if after_errors else 0.0
 
     def _track_direct_candidates(self, image: np.ndarray, guesses: list[tuple[str, np.ndarray]]) -> dict:
         best = {
@@ -739,6 +1114,7 @@ class ExperimentalMonocularVO:
                 image,
                 affine_a=self.current_a,
                 affine_b=self.current_b,
+                require_converged=self.bootstrap_complete,
             ) if len(self.mono_map) == 0 else self.mono_map.direct_references(T_W_C_guess)
             reference_ids = self.mono_map.last_direct_reference_landmark_ids.copy() if len(self.mono_map) > 0 else ids.copy()
             reference_kf_ids = self.mono_map.last_direct_reference_kf_ids.copy() if len(self.mono_map) > 0 else np.empty((0,), dtype=int)
@@ -774,7 +1150,10 @@ class ExperimentalMonocularVO:
                 "klt_flow_cos_p10": 0.0,
                 "reject_reason": "",
             }
-            if len(pts_w) < self.min_direct_landmarks:
+            required_direct_landmarks = self.min_direct_landmarks
+            if len(self.mono_map) > 0:
+                required_direct_landmarks = min(self.min_direct_landmarks, self.mono_map.config.min_keyframe_landmarks)
+            if len(pts_w) < required_direct_landmarks:
                 candidate["reject_reason"] = "insufficient_landmarks"
                 best["candidates"].append(candidate)
                 continue
@@ -804,6 +1183,16 @@ class ExperimentalMonocularVO:
             candidate["klt_residual_p90_px"] = residual_stats["p90"]
             candidate["klt_flow_cos_median"] = flow_stats["median"]
             candidate["klt_flow_cos_p10"] = flow_stats["p10"]
+            if (
+                residual_stats["count"] >= self.candidate_klt_residual_gate_tracks
+                and (
+                    residual_stats["median"] > self.candidate_klt_median_reject_px
+                    or residual_stats["p90"] > self.candidate_klt_p90_reject_px
+                )
+            ):
+                candidate["reject_reason"] = "high_klt_reprojection_residual"
+                best["candidates"].append(candidate)
+                continue
             candidate["score"] = self._direct_candidate_score(inlier_count, residual_stats)
             if candidate["score"] <= best["score"]:
                 candidate["reject_reason"] = "not_best_score"
@@ -971,6 +1360,284 @@ class ExperimentalMonocularVO:
         self.last_essential_inliers = 0
         self.last_essential_used = False
 
+    def _sample_patches(self, image: np.ndarray, pixels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Bilinearly sample the tracker photometric pattern at each pixel.
+
+        Returns (patches, keep) where keep is False for pixels too close to the
+        image border to hold a full pattern.
+        """
+        image_f = image.astype(np.float32)
+        h, w = image.shape
+        patches = []
+        keep = []
+        for px in np.asarray(pixels, dtype=np.float64):
+            u, v = float(px[0]), float(px[1])
+            if u < 2 or u >= w - 2 or v < 2 or v >= h - 2:
+                patches.append(np.zeros(PATTERN_SIZE, dtype=np.float32))
+                keep.append(False)
+                continue
+            patch = nd.map_coordinates(image_f, [v + PATTERN_DY, u + PATTERN_DX], order=1).astype(np.float32)
+            patches.append(patch)
+            keep.append(True)
+        return (
+            np.asarray(patches, dtype=np.float32).reshape(-1, PATTERN_SIZE),
+            np.asarray(keep, dtype=bool),
+        )
+
+    def _filter_point_covariance(self, lm) -> np.ndarray | None:
+        """World-frame 3x3 point covariance of a Sparse3D landmark from its EKF state."""
+        try:
+            _point, jac = lm.anchor_point_and_jacobian()
+        except (ValueError, np.linalg.LinAlgError):
+            return None
+        p3_anchor = jac @ lm.covariance[:3, :3] @ jac.T
+        R_w_a = lm.anchor_T_W_C[:3, :3]
+        p3_world = R_w_a @ p3_anchor @ R_w_a.T
+        if not np.all(np.isfinite(p3_world)):
+            return None
+        return 0.5 * (p3_world + p3_world.T)
+
+    def _needs_keyframe(
+        self,
+        frame_id: int,
+        klt_pixel_guesses: dict[int, np.ndarray] | None,
+        direct_landmarks: int,
+    ) -> tuple[bool, str]:
+        """Scale-invariant keyframe decision (SVO needNewKf).
+
+        Metric motion is unusable when the estimate is under-scaled; instead use
+        median pixel disparity of tracked map points vs the last keyframe, and the
+        tracked-landmark count. Both are scale-invariant.
+        """
+        if len(self.mono_map) == 0:
+            return True, "first"
+        latest = self.mono_map.keyframes[-1]
+        if int(frame_id) - int(latest.frame_id) < self.kf_min_frames_between:
+            return False, ""
+        tracked = klt_pixel_guesses or {}
+        if len(tracked) < self.kf_min_tracked_landmarks:
+            return True, "low_tracked"
+        disparities = []
+        for fid, pixel in tracked.items():
+            ref = latest.observations.get(int(fid)) or latest.features.get(int(fid))
+            if ref is not None:
+                disparities.append(float(np.linalg.norm(np.asarray(pixel, dtype=np.float64) - np.asarray(ref.pixel, dtype=np.float64))))
+        if disparities and float(np.median(disparities)) > self.kf_min_disparity_px:
+            return True, "disparity"
+        return False, ""
+
+    def _store_promotion_covariances(self, ids: np.ndarray) -> None:
+        """Transfer each promoted filter's 3-D covariance onto its map landmark (a prior)."""
+        for fid in ids:
+            lm = self.sparse3d.features.get(int(fid))
+            if lm is None:
+                continue
+            cov = self._filter_point_covariance(lm)
+            if cov is not None:
+                self.mono_map.set_landmark_covariance(int(fid), cov)
+
+    def _pnp_from_klt(
+        self,
+        refs: list[dict],
+        klt_pixel_guesses: dict[int, np.ndarray],
+    ) -> tuple[np.ndarray | None, int]:
+        """Absolute pose (T_C_W) via PnP-RANSAC from map-point 3D <-> KLT 2D matches.
+
+        KLT is pose-drift-free (pure 2D optical flow), so this is a per-frame absolute
+        anchor -- unlike a motion-model seed, it does not inherit prior drift.
+        """
+        if not refs or not klt_pixel_guesses:
+            return None, 0
+        ref_by_id = {int(r["landmark_id"]): r for r in refs}
+        points_w, pixels = [], []
+        for fid, pixel in klt_pixel_guesses.items():
+            ref = ref_by_id.get(int(fid))
+            if ref is None:
+                continue
+            points_w.append(ref["point_w"])
+            pixels.append(pixel)
+        if len(points_w) < self.pnp_min_correspondences:
+            return None, 0
+        points_w = np.asarray(points_w, dtype=np.float64)
+        pixels = np.asarray(pixels, dtype=np.float64)
+        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+            points_w, pixels, self.K, None,
+            reprojectionError=self.pnp_reproj_thresh, confidence=0.99,
+            iterationsCount=100, flags=cv2.SOLVEPNP_EPNP,
+        )
+        if not ok or inliers is None or len(inliers) < self.pnp_min_inliers:
+            return None, 0
+        R, _ = cv2.Rodrigues(rvec)
+        T_C_W = np.eye(4, dtype=np.float64)
+        T_C_W[:3, :3] = R
+        T_C_W[:3, 3] = tvec.reshape(3)
+        return T_C_W, int(len(inliers))
+
+    def _map_promotion_parallax_mask(self, points_w: np.ndarray, ids: np.ndarray) -> np.ndarray:
+        """Keep only landmarks with real anchor->current parallax for map promotion.
+
+        Promotion quality is geometric (parallax), not the filter's radial-blind
+        depth variance (see plan Phase 3B).
+        """
+        keep = np.zeros(len(ids), dtype=bool)
+        if len(ids) == 0:
+            return keep
+        cur_center = self.T_W_C[:3, 3]
+        min_cos = np.cos(np.deg2rad(self.map_promotion_min_parallax_deg))
+        for i, fid in enumerate(ids):
+            lm = self.sparse3d.features.get(int(fid))
+            if lm is None:
+                continue
+            anchor_center = lm.anchor_T_W_C[:3, 3]
+            v0 = points_w[i] - anchor_center
+            v1 = points_w[i] - cur_center
+            n0 = float(np.linalg.norm(v0))
+            n1 = float(np.linalg.norm(v1))
+            if n0 < 1e-9 or n1 < 1e-9:
+                continue
+            cos = float(np.dot(v0, v1) / (n0 * n1))
+            if cos <= min_cos:  # angle >= threshold
+                keep[i] = True
+        return keep
+
+    def _try_two_view_bootstrap(
+        self,
+        frame_id: int,
+        image: np.ndarray,
+        observations: dict[int, np.ndarray],
+    ) -> bool:
+        """Initialize the map from anchor(KF0)<->current via essential+triangulation.
+
+        Scale is fixed exactly once here by normalizing the median triangulated
+        depth to 1.0. Returns True only when a full initial map was seeded.
+        """
+        if len(self.mono_map) == 0 or not self.bootstrap_anchor_observations:
+            return False
+        anchor_kf = self.mono_map.keyframes[0]
+        common = sorted(set(self.bootstrap_anchor_observations) & set(observations))
+        self.last_essential_common_tracks = len(common)
+        self.last_essential_inliers = 0
+        self.last_essential_used = False
+        if len(common) < self.min_essential_tracks:
+            return False
+
+        pts_anchor = np.asarray([self.bootstrap_anchor_observations[fid] for fid in common], dtype=np.float64)
+        pts_cur = np.asarray([observations[fid] for fid in common], dtype=np.float64)
+        # Wait for real parallax before triangulating (avoids degenerate scale).
+        if float(np.median(np.linalg.norm(pts_cur - pts_anchor, axis=1))) < self.bootstrap_min_flow_px:
+            return False
+
+        E, mask = cv2.findEssentialMat(
+            pts_anchor, pts_cur, self.K, method=cv2.RANSAC, prob=0.999, threshold=1.0,
+        )
+        if E is None:
+            return False
+        if E.shape[0] > 3:
+            E = E[:3, :3]
+
+        n_inliers, R_cur_anchor, t_cur_anchor, pose_mask = cv2.recoverPose(
+            E, pts_anchor, pts_cur, self.K, mask=mask,
+        )
+        self.last_essential_inliers = int(n_inliers)
+        if n_inliers < self.min_essential_tracks:
+            return False
+        if _rotation_angle(R_cur_anchor) > self.max_bootstrap_anchor_rotation_rad:
+            return False
+
+        t_dir = t_cur_anchor.reshape(3)
+        t_norm = float(np.linalg.norm(t_dir))
+        if t_norm < 1e-9:
+            return False
+        t_dir = t_dir / t_norm
+
+        inlier_mask = pose_mask.reshape(-1).astype(bool)
+        if int(np.sum(inlier_mask)) < self.min_essential_tracks:
+            return False
+        ids = np.asarray(common, dtype=int)[inlier_mask]
+        p_anchor = pts_anchor[inlier_mask]
+        p_cur = pts_cur[inlier_mask]
+
+        # Triangulate with anchor at [I|0] and current at [R|t] (unit baseline).
+        P0 = self.K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        P1 = self.K @ np.hstack([R_cur_anchor, t_dir.reshape(3, 1)])
+        X4 = cv2.triangulatePoints(P0, P1, p_anchor.T, p_cur.T)
+        w = X4[3]
+        finite = np.abs(w) > 1e-9
+        pts_a = np.full((X4.shape[1], 3), np.nan, dtype=np.float64)
+        pts_a[finite] = (X4[:3, finite] / w[finite]).T
+
+        z_anchor = pts_a[:, 2]
+        pts_c = pts_a @ R_cur_anchor.T + t_dir
+        z_cur = pts_c[:, 2]
+        cheirality = finite & np.isfinite(z_anchor) & (z_anchor > 0) & (z_cur > 0)
+        if int(np.sum(cheirality)) < self.bootstrap_min_triangulated:
+            return False
+
+        # Median triangulation angle (parallax) between the two viewing rays.
+        cam_cur_center = -R_cur_anchor.T @ t_dir
+        ray0 = pts_a[cheirality]
+        ray1 = pts_a[cheirality] - cam_cur_center
+        cos_par = np.sum(ray0 * ray1, axis=1) / (
+            np.linalg.norm(ray0, axis=1) * np.linalg.norm(ray1, axis=1) + 1e-12
+        )
+        parallax_deg = np.degrees(np.arccos(np.clip(cos_par, -1.0, 1.0)))
+        if float(np.median(parallax_deg)) < self.bootstrap_min_parallax_deg:
+            return False
+
+        ids = ids[cheirality]
+        p_anchor = p_anchor[cheirality]
+        X = pts_a[cheirality]
+
+        # Fix scale exactly once: normalize median anchor-frame depth to 1.0.
+        median_depth = float(np.median(X[:, 2]))
+        if not np.isfinite(median_depth) or median_depth <= 1e-6:
+            return False
+        scale = 1.0 / median_depth
+        X = X * scale
+        t_scaled = t_dir * scale
+
+        # Anchor pose is the gauge; recover the current pose from the scaled baseline.
+        T_cur_anchor = np.eye(4)
+        T_cur_anchor[:3, :3] = R_cur_anchor
+        T_cur_anchor[:3, 3] = t_scaled
+        T_W_cur = anchor_kf.T_W_C @ np.linalg.inv(T_cur_anchor)
+        points_w = (anchor_kf.T_W_C[:3, :3] @ X.T).T + anchor_kf.T_W_C[:3, 3]
+
+        intensities, patch_ok = self._sample_patches(anchor_kf.image, p_anchor)
+        if int(np.sum(patch_ok)) < self.bootstrap_min_triangulated:
+            return False
+        ids = ids[patch_ok]
+        points_w = points_w[patch_ok]
+        intensities = intensities[patch_ok]
+        p_anchor = p_anchor[patch_ok]
+
+        host_observations = {int(fid): p_anchor[i].copy() for i, fid in enumerate(ids)}
+        sigma = self.sparse3d.settings.sigma_pixel
+        added = self.mono_map.add_landmarks_to_keyframe(
+            anchor_kf.kf_id,
+            ids,
+            points_w,
+            intensities,
+            observations=host_observations,
+            observation_cov=np.eye(2) * sigma * sigma,
+        )
+        if added <= 0:
+            return False
+
+        self.T_W_C = T_W_cur
+        self.current_a = anchor_kf.affine_a
+        self.current_b = anchor_kf.affine_b
+        self.last_essential_used = True
+        self.bootstrap_complete = True
+        self.have_direct_motion_model = False
+        self.last_direct_delta = np.eye(4)
+        # Retire the depth filters but KEEP the KLT tracks so the initial map points
+        # stay tracked by the front-end (covisibility/tracking).
+        self.sparse3d.retire(ids)
+        self.last_keyframe_inserted = True
+        self.last_keyframe_reason = "two_view_bootstrap"
+        return True
+
     def _essential_pose_guess(self, observations: dict[int, np.ndarray]) -> np.ndarray | None:
         common = sorted(set(self.prev_observations) & set(observations))
         self.last_essential_common_tracks = len(common)
@@ -1032,6 +1699,15 @@ class ExperimentalMonocularVO:
             delta[:3, 3] *= self.max_bootstrap_step / step
         return self.T_W_C @ delta
 
+    def _pixel_from_bearing(self, bearing: np.ndarray) -> np.ndarray:
+        b = np.asarray(bearing, dtype=np.float64)
+        if abs(float(b[2])) < 1e-12:
+            return np.array([np.nan, np.nan], dtype=np.float64)
+        return np.array([
+            self.K[0, 0] * b[0] / b[2] + self.K[0, 2],
+            self.K[1, 1] * b[1] / b[2] + self.K[1, 2],
+        ], dtype=np.float64)
+
     def _flow_rotation_guess(self, pts_prev: np.ndarray, pts_cur: np.ndarray) -> np.ndarray | None:
         prev_n = cv2.undistortPoints(pts_prev.reshape(-1, 1, 2), self.K, None).reshape(-1, 2)
         cur_n = cv2.undistortPoints(pts_cur.reshape(-1, 1, 2), self.K, None).reshape(-1, 2)
@@ -1061,13 +1737,10 @@ class ExperimentalMonocularVO:
         R_cur_prev, _ = cv2.Rodrigues(omega.reshape(3, 1))
         return R_cur_prev
 
-    def _bootstrap_step_scale(self, observations: dict[int, np.ndarray]) -> float:
-        common = sorted(set(self.prev_observations) & set(observations))
-        if len(common) < 8:
+    def _point_flow_step_scale(self, pts_prev: np.ndarray, pts_cur: np.ndarray) -> float:
+        if len(pts_prev) < 8 or len(pts_cur) < 8:
             return min(0.05, self.max_bootstrap_step)
-        pts_prev = np.asarray([self.prev_observations[fid] for fid in common], dtype=np.float64)
-        pts_cur = np.asarray([observations[fid] for fid in common], dtype=np.float64)
-        flow = np.median(pts_cur - pts_prev, axis=0)
+        flow = np.median(np.asarray(pts_cur, dtype=np.float64) - np.asarray(pts_prev, dtype=np.float64), axis=0)
         if not np.all(np.isfinite(flow)):
             return min(0.05, self.max_bootstrap_step)
         step = np.linalg.norm([
@@ -1075,6 +1748,14 @@ class ExperimentalMonocularVO:
             flow[1] * self.image_motion_fallback_depth / self.K[1, 1],
         ])
         return float(np.clip(step, 1e-3, self.max_bootstrap_step))
+
+    def _bootstrap_step_scale(self, observations: dict[int, np.ndarray]) -> float:
+        common = sorted(set(self.prev_observations) & set(observations))
+        if len(common) < 8:
+            return min(0.05, self.max_bootstrap_step)
+        pts_prev = np.asarray([self.prev_observations[fid] for fid in common], dtype=np.float64)
+        pts_cur = np.asarray([observations[fid] for fid in common], dtype=np.float64)
+        return self._point_flow_step_scale(pts_prev, pts_cur)
 
 
 def _rotation_angle(R: np.ndarray) -> float:

@@ -642,6 +642,106 @@ class PhotometricBA:
 
         return {"ran": True, "window": len(keyframes), "edges": len(edges)}
 
+    def optimize_mono_joint_window(self, mono_window, max_nfev=40, max_points=200, prior_reg=1e-6):
+        """Joint local BA over window poses + covisible points (Phase 3A).
+
+        Optimizes keyframe poses (oldest fixed as gauge) and the positions of
+        landmarks observed in >=2 window keyframes, with reprojection likelihood +
+        a per-point Gaussian prior from the covariance transferred at promotion
+        (well-triangulated points -> tight prior, fresh points -> loose). scipy TRF
+        with a sparse Jacobian pattern.
+        """
+        from collections import defaultdict
+        from scipy.sparse import lil_matrix
+
+        keyframes, mono_map = self._mono_window(mono_window)
+        if len(keyframes) < 2:
+            return {"ran": False, "window": len(keyframes), "points": 0, "edges": 0}
+
+        lm_obs = defaultdict(list)
+        for i, kf in enumerate(keyframes):
+            for fid, obs in kf.observations.items():
+                if int(fid) in mono_map.landmarks:
+                    sigma = np.sqrt(np.maximum(np.diag(np.asarray(obs.covariance, dtype=np.float64)), 1e-9))
+                    lm_obs[int(fid)].append((i, np.asarray(obs.pixel, dtype=np.float64), sigma))
+
+        covis = [fid for fid, ob in lm_obs.items() if len(ob) >= 2]
+        if len(covis) == 0:
+            return {"ran": False, "window": len(keyframes), "points": 0, "edges": 0}
+        if len(covis) > max_points:
+            sel = np.linspace(0, len(covis) - 1, max_points).astype(int)
+            covis = [covis[k] for k in sel]
+        point_idx = {fid: j for j, fid in enumerate(covis)}
+        n_pts = len(covis)
+        n_opt = len(keyframes) - 1
+
+        original_poses = [kf.T_W_C.copy() for kf in keyframes]
+        point0 = np.asarray([mono_map.landmarks[fid].point_w for fid in covis], dtype=np.float64)
+        priors = point0.copy()
+        prior_L = np.zeros((n_pts, 3, 3))
+        for j, fid in enumerate(covis):
+            P = np.asarray(mono_map.landmarks[fid].point_covariance, dtype=np.float64)
+            try:
+                prior_L[j] = np.linalg.cholesky(np.linalg.inv(P + np.eye(3) * prior_reg))
+            except np.linalg.LinAlgError:
+                prior_L[j] = np.eye(3) * np.sqrt(prior_reg)
+
+        edges = [(i, point_idx[fid], pixel, sigma) for fid in covis for (i, pixel, sigma) in lm_obs[fid]]
+        n_repro = len(edges)
+        n_res = 2 * n_repro + 3 * n_pts
+        n_var = 6 * n_opt + 3 * n_pts
+
+        def unpack(x):
+            poses = [original_poses[0]]
+            for i in range(n_opt):
+                poses.append(original_poses[i + 1] @ sp.SE3.exp(x[i * 6:(i + 1) * 6]).matrix())
+            return poses, x[6 * n_opt:].reshape(n_pts, 3)
+
+        def residual_fn(x):
+            poses, points = unpack(x)
+            r = np.zeros(n_res)
+            for e, (i, j, pixel, sigma) in enumerate(edges):
+                T_C_W = np.linalg.inv(poses[i])
+                p = T_C_W[:3, :3] @ points[j] + T_C_W[:3, 3]
+                if p[2] > 0.01:
+                    pred = np.array([self.fx * p[0] / p[2] + self.cx, self.fy * p[1] / p[2] + self.cy])
+                    r[2 * e:2 * e + 2] = (pred - pixel) / sigma
+            base = 2 * n_repro
+            for j in range(n_pts):
+                r[base + 3 * j:base + 3 * j + 3] = prior_L[j].T @ (points[j] - priors[j])
+            return r
+
+        S = lil_matrix((n_res, n_var), dtype=bool)
+        for e, (i, j, _pixel, _sigma) in enumerate(edges):
+            if i >= 1:
+                S[2 * e:2 * e + 2, (i - 1) * 6:i * 6] = True
+            S[2 * e:2 * e + 2, 6 * n_opt + 3 * j:6 * n_opt + 3 * j + 3] = True
+        base = 2 * n_repro
+        for j in range(n_pts):
+            S[base + 3 * j:base + 3 * j + 3, 6 * n_opt + 3 * j:6 * n_opt + 3 * j + 3] = True
+
+        x0 = np.zeros(n_var)
+        x0[6 * n_opt:] = point0.reshape(-1)
+        lb = np.full(n_var, -np.inf)
+        ub = np.full(n_var, np.inf)
+        lb[:6 * n_opt] = -0.2
+        ub[:6 * n_opt] = 0.2
+        cost_before = 0.5 * float(np.sum(residual_fn(x0) ** 2))
+        res = least_squares(
+            residual_fn, x0, jac_sparsity=S, bounds=(lb, ub),
+            method="trf", loss="huber", f_scale=3.0, max_nfev=max_nfev,
+        )
+
+        poses, points = unpack(res.x)
+        for i in range(n_opt):
+            keyframes[i + 1].T_W_C = poses[i + 1]
+        for j, fid in enumerate(covis):
+            mono_map.update_landmark_point(fid, points[j])
+        return {
+            "ran": True, "window": len(keyframes), "points": n_pts, "edges": n_repro,
+            "cost_before": cost_before, "cost_after": float(res.cost),
+        }
+
     def _visible_mask(self, pts_w, T_W_C, image_shape):
         if len(pts_w) == 0:
             return np.zeros((0,), dtype=bool)

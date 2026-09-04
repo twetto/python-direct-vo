@@ -15,7 +15,7 @@ from src.profiler import profiler
 from src.tracker import DirectTracker
 from src.map import Map
 from src.optimizer import PhotometricBA
-from src.diagnostics import VOMonitor
+from src.diagnostics import VOMonitor, stereo_flow_reprojection_error
 from src.feature_tracker import FeatureTracker, FeatureTrackerConfig
 from src.landmark_filter import Sparse3DFilterBank, Sparse3DSettings
 from src.monocular import ExperimentalMonocularVO
@@ -86,7 +86,9 @@ def main():
     parser.add_argument('--max-frames', type=int, default=None, help='Stop after this many input frames')
     parser.add_argument('--dataset-path', type=str, default=None, help='Override EuRoC dataset path')
     parser.add_argument('--diagnostics-log', type=str, default=None, help='Write per-frame diagnostics as JSONL')
+    parser.add_argument('--no-mono-debug-stereo-depth', action='store_true', help='Disable stereo-depth debug metrics in mono mode')
     args = parser.parse_args()
+    mono_debug_stereo_depth = bool(args.mono and not args.no_mono_debug_stereo_depth)
 
     # DATASET_PATH = "C:/Users/twetto/Downloads/machine_hall/machine_hall/MH_01_easy/MH_01_easy"
     DATASET_PATH = args.dataset_path or "C:/Users/twetto/Downloads/vicon_room1/vicon_room1/V1_01_easy"
@@ -136,10 +138,10 @@ def main():
     
     print("Loading EuRoC Dataset...")
     loader_left = EuRoCLoader(DATASET_PATH, cam_id=0, undistort=False)
-    loader_right = None if args.mono else EuRoCLoader(DATASET_PATH, cam_id=1, undistort=False)
+    loader_right = EuRoCLoader(DATASET_PATH, cam_id=1, undistort=False) if (not args.mono or mono_debug_stereo_depth) else None
 
     print("Initializing Stereo Rectification...")
-    if args.mono:
+    if args.mono and not mono_debug_stereo_depth:
         maps_left = cv2.initUndistortRectifyMap(
             loader_left.camera.K,
             loader_left.camera.dist_coeffs,
@@ -184,6 +186,8 @@ def main():
     current_a = 0.0
     current_b = 0.0
     prev_img_rect = None
+    prev_depth_rect = None
+    prev_T_W_C_for_stereo_flow_debug = None
     
     traj_positions = []
     traj_positions_gt = []
@@ -191,11 +195,11 @@ def main():
     align_Y = []
     
     print("Starting Direct Visual Odometry with Rerun...")
-    frame_iter = enumerate(loader_left) if args.mono else enumerate(zip(loader_left, loader_right))
+    frame_iter = enumerate(loader_left) if args.mono and loader_right is None else enumerate(zip(loader_left, loader_right))
     for frame_idx, samples in frame_iter:
         if args.max_frames is not None and frame_idx >= args.max_frames:
             break
-        if args.mono:
+        if args.mono and loader_right is None:
             sample_left = samples
             sample_right = None
         else:
@@ -229,7 +233,7 @@ def main():
 
         profiler.start("0. Data & Rectification")
         img_left_rect = cv2.remap(sample_left.image, maps_left[0], maps_left[1], cv2.INTER_LINEAR)
-        if args.mono:
+        if args.mono and sample_right is None:
             img_right_rect = None
             depth = np.zeros_like(img_left_rect, dtype=np.float32)
         else:
@@ -401,6 +405,26 @@ def main():
             sparse3d.update(frame_idx, sparse3d_obs, T_W_C)
             
         traj_positions.append(T_W_C[:3, 3])
+        if args.mono and mono_debug_stereo_depth:
+            stereo_flow_reproj = stereo_flow_reprojection_error(
+                prev_img_rect,
+                img_left_rect,
+                prev_depth_rect,
+                K_rect,
+                prev_T_W_C_for_stereo_flow_debug,
+                T_W_C,
+                mono_vo.mono_map.point_cloud(max_points=1000),
+            )
+        else:
+            stereo_flow_reproj = stereo_flow_reprojection_error(
+                None,
+                None,
+                None,
+                K_rect,
+                None,
+                T_W_C,
+                (np.empty((0, 3), dtype=np.float64),),
+            )
         
         # Add Estimated SE(3) basis points for robust alignment
         align_X.append(T_W_C[:3, 3])
@@ -529,6 +553,8 @@ def main():
             rr.log("metrics/mono_depth_local_jump_p90_m", rr.Scalars([depth_jump["p90_abs"]]))
             rr.log("metrics/mono_keyframe_klt_residual_median_px", rr.Scalars([mono_result.mono_keyframe_klt_residual_median_px]))
             rr.log("metrics/mono_keyframe_klt_residual_p90_px", rr.Scalars([mono_result.mono_keyframe_klt_residual_p90_px]))
+            rr.log("metrics/mono_stereo_flow_reproj_median_px", rr.Scalars([stereo_flow_reproj["median_px"]]))
+            rr.log("metrics/mono_stereo_flow_reproj_p90_px", rr.Scalars([stereo_flow_reproj["p90_px"]]))
             rr.log("metrics/mono_keyframe_pose_update_norm", rr.Scalars([mono_result.mono_keyframe_pose_update_norm]))
         
         if frame_idx % 10 == 0:
@@ -546,6 +572,8 @@ def main():
                     f" | gftt_mask={mono_result.mono_gftt_exclusions}"
                     f" | kf_klt={mono_result.mono_keyframe_klt_inliers}/{mono_result.mono_keyframe_klt_tracks}"
                     f" | kf_res={mono_result.mono_keyframe_klt_residual_median_px:.1f}px"
+                    f" | stereo_flow_res={stereo_flow_reproj['median_px']:.1f}/{stereo_flow_reproj['p90_px']:.1f}px"
+                    f"({stereo_flow_reproj['compared']})"
                     f" | flow_cos={mono_result.mono_keyframe_klt_flow_cos_median:.2f}"
                     f" | kf_pose_delta={mono_result.mono_keyframe_pose_update_norm:.3f}m"
                 )
@@ -557,6 +585,7 @@ def main():
             "mode": "mono" if args.mono else "stereo",
             "timestamp": float(sample_left.timestamp),
             "position": T_W_C[:3, 3].astype(float).tolist(),
+            "gt_position": T_W_C_gt[:3, 3].astype(float).tolist(),
             "active_landmarks": int(num_pts),
             "inliers": int(num_inliers),
             "keyframes": int(num_kfs),
@@ -604,6 +633,21 @@ def main():
             "mono_keyframe_klt_residual_p90_px": float(mono_result.mono_keyframe_klt_residual_p90_px) if args.mono else 0.0,
             "mono_keyframe_klt_flow_cos_median": float(mono_result.mono_keyframe_klt_flow_cos_median) if args.mono else 0.0,
             "mono_keyframe_klt_flow_cos_p10": float(mono_result.mono_keyframe_klt_flow_cos_p10) if args.mono else 0.0,
+            "mono_stereo_flow_reproj_projected": int(stereo_flow_reproj["projected"]) if args.mono else 0,
+            "mono_stereo_flow_reproj_sampled": int(stereo_flow_reproj["sampled"]) if args.mono else 0,
+            "mono_stereo_flow_reproj_valid_depth": int(stereo_flow_reproj["valid_depth"]) if args.mono else 0,
+            "mono_stereo_flow_reproj_tracked": int(stereo_flow_reproj["tracked"]) if args.mono else 0,
+            "mono_stereo_flow_reproj_compared": int(stereo_flow_reproj["compared"]) if args.mono else 0,
+            "mono_stereo_flow_reproj_median_px": float(stereo_flow_reproj["median_px"]) if args.mono else 0.0,
+            "mono_stereo_flow_reproj_p90_px": float(stereo_flow_reproj["p90_px"]) if args.mono else 0.0,
+            "mono_stereo_flow_depth_ratio_median": float(stereo_flow_reproj["median_depth_ratio"]) if args.mono else 0.0,
+            "mono_svo_match_stats": mono_result.mono_svo_match_stats if args.mono else {},
+            "mono_keyframe_reproj_rejected": int(mono_result.mono_keyframe_reproj_rejected) if args.mono else 0,
+            "mono_keyframe_reproj_median_px": float(mono_result.mono_keyframe_reproj_median_px) if args.mono else 0.0,
+            "mono_landmark_updates": int(mono_result.mono_landmark_updates) if args.mono else 0,
+            "mono_landmark_update_median_m": float(mono_result.mono_landmark_update_median_m) if args.mono else 0.0,
+            "mono_landmark_reproj_before_px": float(mono_result.mono_landmark_reproj_before_px) if args.mono else 0.0,
+            "mono_landmark_reproj_after_px": float(mono_result.mono_landmark_reproj_after_px) if args.mono else 0.0,
             "mono_keyframe_pose_update_norm": float(mono_result.mono_keyframe_pose_update_norm) if args.mono else 0.0,
             "mono_keyframe_pose_update_rot_deg": float(mono_result.mono_keyframe_pose_update_rot_deg) if args.mono else 0.0,
             "mono_direct_candidate_stats": mono_result.mono_direct_candidate_stats if args.mono else [],
@@ -621,11 +665,20 @@ def main():
         
         # Cache image for LK flow in the next frame
         profiler.stop("5. Rerun Visualization")
+        prev_depth_rect = depth.copy() if args.mono and mono_debug_stereo_depth else None
+        prev_T_W_C_for_stereo_flow_debug = T_W_C.copy() if args.mono and mono_debug_stereo_depth else None
         if frame_idx > 0 and frame_idx % 50 == 0:
             profiler.print_stats()
             
         prev_img_rect = img_left_rect.copy()
     diag_log.close()
+
+    # --- Scale-aware trajectory evaluation (Phase 0 measuring stick) ---
+    if len(traj_positions) >= 3 and len(traj_positions_gt) >= 3:
+        from src.mono_eval import evaluate, format_report
+        n = min(len(traj_positions), len(traj_positions_gt))
+        metrics = evaluate(np.asarray(traj_positions[:n]), np.asarray(traj_positions_gt[:n]))
+        print(format_report(metrics))
         
 if __name__ == '__main__':
     main()

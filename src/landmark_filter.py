@@ -110,8 +110,7 @@ class LandmarkFilter:
     state: np.ndarray
     covariance: np.ndarray
     status: LandmarkStatus = LandmarkStatus.IMMATURE
-    inlier_alpha: float = 10.0
-    inlier_beta: float = 10.0
+    consecutive_failures: int = 0
     observations: list[LandmarkObservation] = field(default_factory=list)
 
     @classmethod
@@ -209,16 +208,19 @@ class LandmarkFilter:
 
         nis = float(y.T @ S_inv @ y)
         if nis > gate_chi2:
-            self.inlier_beta += 1.0
+            # Pure-Gaussian outlier rejection via the Mahalanobis gate; the old
+            # Gauss-Beta inlier mixture is gone (outlier tracks are rejected upstream
+            # by fundamental-RANSAC, drifting tracks by this gate over time).
+            self.consecutive_failures += 1
             return False
 
         K_gain = self.covariance @ H.T @ S_inv
         self.state = self.state + K_gain @ y
         I = np.eye(5)
         self.covariance = (I - K_gain @ H) @ self.covariance @ (I - K_gain @ H).T + K_gain @ measurement_cov @ K_gain.T
-        self.inlier_alpha += 1.0
+        self.consecutive_failures = 0
         self.observations.append(LandmarkObservation(frame_id, np.asarray(pixel, dtype=np.float64), measurement_cov.copy()))
-        if len(self.observations) >= 3 and self.inlier_ratio() >= 0.5:
+        if len(self.observations) >= 3:
             self.status = LandmarkStatus.MATURE
         return True
 
@@ -244,10 +246,6 @@ class LandmarkFilter:
         q_chart = j_inv @ q_current @ j_inv.T
         p_new = self.covariance[:3, :3] + q_chart
         self.covariance[:3, :3] = 0.5 * (p_new + p_new.T)
-
-    def inlier_ratio(self) -> float:
-        total = self.inlier_alpha + self.inlier_beta
-        return 0.0 if total <= 0 else self.inlier_alpha / total
 
     def measurement_jacobian(self, T_C_A: np.ndarray, K: np.ndarray) -> np.ndarray:
         p_anchor, j_anchor = self.anchor_point_and_jacobian()
@@ -316,6 +314,7 @@ class Sparse3DFilterBank:
         pixels: dict[int, np.ndarray],
         T_W_C: np.ndarray,
         remove_missing: bool = True,
+        preserve_previous: bool = False,
     ) -> None:
         curr = {
             int(fid): np.asarray(pixel, dtype=np.float64)
@@ -352,7 +351,7 @@ class Sparse3DFilterBank:
                 bias_rw_sigma=self.settings.bias_walk_sigma,
                 gate_chi2=self.settings.mahalanobis_gate_chi2,
             )
-            if not ok and lm.inlier_ratio() < self.settings.conv_inlier_ratio * 0.5:
+            if not ok and lm.consecutive_failures >= 3:
                 lm.status = LandmarkStatus.REJECTED
                 del self.features[fid]
                 self.missed_frames.pop(fid, None)
@@ -378,9 +377,10 @@ class Sparse3DFilterBank:
                     del self.pending[fid]
 
         self.pending = {fid: p for fid, p in self.pending.items() if fid in curr}
-        self.prev_pixels = curr
-        self.prev_frame_id = frame_id
-        self.prev_T_W_C = T_W_C.copy()
+        if not preserve_previous:
+            self.prev_pixels = curr
+            self.prev_frame_id = frame_id
+            self.prev_T_W_C = T_W_C.copy()
 
     def retire(self, feature_ids) -> None:
         ids = {int(fid) for fid in feature_ids}
@@ -458,7 +458,7 @@ class Sparse3DFilterBank:
     def feature_count(self) -> int:
         return len(self.features)
 
-    def query(self, fid: int, T_W_C: np.ndarray | None = None) -> tuple[float, float]:
+    def query(self, fid: int, T_W_C: np.ndarray | None = None, require_converged: bool = True) -> tuple[float, float]:
         lm = self.features.get(fid)
         if lm is None:
             return -1.0, float("inf")
@@ -466,10 +466,13 @@ class Sparse3DFilterBank:
         point_c = lm.current_position(T_C_A)
         depth = float(point_c[2])
         depth_var = lm.depth_variance(T_C_A)
+        if not require_converged:
+            if depth <= 0 or not np.isfinite(depth) or not np.isfinite(depth_var):
+                return -1.0, float("inf")
+            return depth, depth_var
         if (
             depth <= 0
             or len(lm.observations) < self.settings.min_track_length
-            or lm.inlier_ratio() < self.settings.conv_inlier_ratio
             or depth_var > self.settings.conv_depth_variance
         ):
             return -1.0, float("inf")
@@ -481,6 +484,7 @@ class Sparse3DFilterBank:
         image: np.ndarray | None = None,
         affine_a: float = 0.0,
         affine_b: float = 0.0,
+        require_converged: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         points_w = []
         intensities = []
@@ -495,7 +499,7 @@ class Sparse3DFilterBank:
         pattern_dy = np.array([0, 0, 0, 1, -1])
 
         for fid, lm in self.features.items():
-            depth, _ = self.query(fid, T_W_C)
+            depth, _ = self.query(fid, T_W_C, require_converged=require_converged)
             if depth <= 0:
                 continue
             point_w = lm.anchor_T_W_C[:3, :3] @ lm.anchor_point() + lm.anchor_T_W_C[:3, 3]

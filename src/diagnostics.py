@@ -1,8 +1,144 @@
 import numpy as np
 import logging
+import cv2
 
 logging.basicConfig(level=logging.INFO, format='[DEBUG-MONITOR] %(message)s')
 logger = logging.getLogger('vo_monitor')
+
+
+def stereo_flow_reprojection_error(
+    prev_image,
+    image,
+    prev_depth,
+    K,
+    prev_T_W_C,
+    T_W_C,
+    point_cloud,
+    max_points=1000,
+    min_depth=0.2,
+    max_depth=20.0,
+):
+    points_w = point_cloud[0] if isinstance(point_cloud, tuple) else point_cloud
+    points_w = np.asarray(points_w, dtype=np.float64)
+    if (
+        prev_image is None
+        or image is None
+        or prev_depth is None
+        or prev_T_W_C is None
+        or len(points_w) == 0
+    ):
+        return _empty_stereo_flow_reprojection_stats()
+
+    prev_image_u8 = prev_image.astype(np.uint8)
+    image_u8 = image.astype(np.uint8)
+    depth = np.asarray(prev_depth, dtype=np.float32)
+    h, w = prev_image_u8.shape
+    T_prev_C_W = np.linalg.inv(prev_T_W_C)
+    pts_prev_c = points_w @ T_prev_C_W[:3, :3].T + T_prev_C_W[:3, 3]
+    z_prev = pts_prev_c[:, 2]
+    z_safe = np.clip(z_prev, 1e-9, None)
+    uv_prev = np.column_stack([
+        K[0, 0] * pts_prev_c[:, 0] / z_safe + K[0, 2],
+        K[1, 1] * pts_prev_c[:, 1] / z_safe + K[1, 2],
+    ])
+    valid = (
+        (z_prev > min_depth)
+        & (uv_prev[:, 0] >= 2)
+        & (uv_prev[:, 0] < w - 2)
+        & (uv_prev[:, 1] >= 2)
+        & (uv_prev[:, 1] < h - 2)
+    )
+    if not np.any(valid):
+        return _empty_stereo_flow_reprojection_stats(projected=int(len(points_w)))
+
+    candidate_idx = np.flatnonzero(valid)
+    if len(candidate_idx) > max_points:
+        candidate_idx = candidate_idx[:max_points]
+    p0 = uv_prev[candidate_idx].astype(np.float32)
+    u0 = np.clip(np.round(p0[:, 0]).astype(int), 0, w - 1)
+    v0 = np.clip(np.round(p0[:, 1]).astype(int), 0, h - 1)
+    stereo_depth = depth[v0, u0].astype(np.float64)
+    valid_depth = (stereo_depth > min_depth) & (stereo_depth < max_depth) & np.isfinite(stereo_depth)
+    if not np.any(valid_depth):
+        return _empty_stereo_flow_reprojection_stats(projected=int(np.sum(valid)), sampled=len(candidate_idx))
+
+    candidate_idx = candidate_idx[valid_depth]
+    p0 = p0[valid_depth]
+    stereo_depth = stereo_depth[valid_depth]
+    p1, status, _err = cv2.calcOpticalFlowPyrLK(
+        prev_image_u8,
+        image_u8,
+        p0.reshape(-1, 1, 2),
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+    )
+    if p1 is None or status is None:
+        return _empty_stereo_flow_reprojection_stats(
+            projected=int(np.sum(valid)),
+            sampled=int(len(candidate_idx)),
+            valid_depth=int(len(candidate_idx)),
+        )
+    p1 = p1.reshape(-1, 2).astype(np.float64)
+    tracked = status.reshape(-1).astype(bool)
+    tracked &= (p1[:, 0] >= 2) & (p1[:, 0] < w - 2) & (p1[:, 1] >= 2) & (p1[:, 1] < h - 2)
+    if not np.any(tracked):
+        return _empty_stereo_flow_reprojection_stats(
+            projected=int(np.sum(valid)),
+            sampled=int(len(candidate_idx)),
+            valid_depth=int(len(candidate_idx)),
+        )
+
+    tracked_idx = candidate_idx[tracked]
+    flow_pixels = p1[tracked]
+    T_C_W = np.linalg.inv(T_W_C)
+    pts_cur_c = points_w[tracked_idx] @ T_C_W[:3, :3].T + T_C_W[:3, 3]
+    z_cur = pts_cur_c[:, 2]
+    z_cur_safe = np.clip(z_cur, 1e-9, None)
+    mono_pixels = np.column_stack([
+        K[0, 0] * pts_cur_c[:, 0] / z_cur_safe + K[0, 2],
+        K[1, 1] * pts_cur_c[:, 1] / z_cur_safe + K[1, 2],
+    ])
+    visible_cur = (
+        (z_cur > min_depth)
+        & (mono_pixels[:, 0] >= 2)
+        & (mono_pixels[:, 0] < w - 2)
+        & (mono_pixels[:, 1] >= 2)
+        & (mono_pixels[:, 1] < h - 2)
+    )
+    if not np.any(visible_cur):
+        return _empty_stereo_flow_reprojection_stats(
+            projected=int(np.sum(valid)),
+            sampled=int(len(candidate_idx)),
+            valid_depth=int(len(candidate_idx)),
+            tracked=int(np.sum(tracked)),
+        )
+
+    errors = np.linalg.norm(mono_pixels[visible_cur] - flow_pixels[visible_cur], axis=1)
+    depth_ratio = z_prev[tracked_idx][visible_cur] / stereo_depth[tracked][visible_cur]
+    return {
+        "projected": int(np.sum(valid)),
+        "sampled": int(len(candidate_idx)),
+        "valid_depth": int(len(candidate_idx)),
+        "tracked": int(np.sum(tracked)),
+        "compared": int(len(errors)),
+        "median_px": float(np.median(errors)) if len(errors) else 0.0,
+        "p90_px": float(np.percentile(errors, 90)) if len(errors) else 0.0,
+        "median_depth_ratio": float(np.median(depth_ratio)) if len(depth_ratio) else 0.0,
+    }
+
+
+def _empty_stereo_flow_reprojection_stats(projected=0, sampled=0, valid_depth=0, tracked=0):
+    return {
+        "projected": int(projected),
+        "sampled": int(sampled),
+        "valid_depth": int(valid_depth),
+        "tracked": int(tracked),
+        "compared": 0,
+        "median_px": 0.0,
+        "p90_px": 0.0,
+        "median_depth_ratio": 0.0,
+    }
 
 class VOMonitor:
     def __init__(self):

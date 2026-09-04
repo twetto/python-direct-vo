@@ -16,6 +16,7 @@ from src.landmark_filter import (
 from src.monocular import ExperimentalMonocularVO
 from src.mono_map import MonoMap, MonoMapConfig
 from src.optimizer import PhotometricBA
+from src.diagnostics import stereo_flow_reprojection_error
 from src.visualization import colorize_scalar, projected_depth_discontinuity
 
 def get_dummy_camera():
@@ -360,7 +361,9 @@ def test_landmark_filter_gates_large_outlier():
     accepted = lm.update(1, np.array([50.0, 50.0]), np.eye(4), K, np.eye(2))
 
     assert not accepted
-    assert lm.inlier_beta > 10.0
+    # Pure-Gaussian filter: the Mahalanobis gate rejects and counts a failure
+    # (the old Gauss-Beta inlier_beta counter is gone).
+    assert lm.consecutive_failures == 1
 
 
 def test_bearing_chart_jacobian_matches_finite_difference():
@@ -622,6 +625,34 @@ def test_projected_depth_discontinuity_reports_local_depth_jumps():
     assert np.isclose(stats["median_abs"], 6.0)
 
 
+def test_stereo_flow_reprojection_error_uses_depth_backed_flow_reference():
+    K = get_dummy_camera()
+    T0 = np.eye(4)
+    T1 = np.eye(4)
+    T1[0, 3] = 0.05
+    points = np.column_stack([
+        np.linspace(-0.3, 0.3, 12),
+        np.zeros(12),
+        np.ones(12) * 4.0,
+    ])
+    uv0, _ = project_world_points(K, T0, points)
+    uv1, _ = project_world_points(K, T1, points)
+    img0 = np.zeros((480, 640), dtype=np.uint8)
+    img1 = np.zeros_like(img0)
+    depth0 = np.zeros_like(img0, dtype=np.float32)
+    for p0, p1 in zip(uv0, uv1):
+        cv2.circle(img0, tuple(np.round(p0).astype(int)), 4, 255, -1)
+        cv2.circle(img1, tuple(np.round(p1).astype(int)), 4, 255, -1)
+        u, v = np.round(p0).astype(int)
+        depth0[v, u] = 4.0
+
+    stats = stereo_flow_reprojection_error(img0, img1, depth0, K, T0, T1, (points,))
+
+    assert stats["valid_depth"] == len(points)
+    assert stats["compared"] >= 8
+    assert stats["median_px"] < 1.0
+
+
 def test_sparse3d_mature_landmarks_export_tracker_arrays():
     K = get_dummy_camera()
     settings = Sparse3DSettings(
@@ -653,6 +684,52 @@ def test_sparse3d_mature_landmarks_export_tracker_arrays():
     assert a_vals.shape == (1,)
     assert b_vals.shape == (1,)
     assert ids.tolist() == [42]
+
+
+def test_sparse3d_provisional_landmarks_can_seed_initial_direct_tracking():
+    K = get_dummy_camera()
+    settings = Sparse3DSettings(min_track_length=3, conv_depth_variance=0.01)
+    bank = Sparse3DFilterBank(K, settings)
+    image = np.zeros((480, 640), dtype=np.uint8)
+    lm = LandmarkFilter.from_anchor_pixel(
+        7,
+        0,
+        np.array([320.0, 240.0]),
+        K,
+        initial_depth=4.0,
+        depth_sigma=2.0,
+        anchor_T_W_C=np.eye(4),
+    )
+    lm.update(1, np.array([321.0, 240.0]), np.eye(4), K, np.eye(2) * 0.25)
+    bank.features[7] = lm
+
+    strict_pts, *_ = bank.mature_landmarks(np.eye(4), image, require_converged=True)
+    provisional_pts, *_ = bank.mature_landmarks(np.eye(4), image, require_converged=False)
+
+    assert strict_pts.shape[0] == 0
+    assert provisional_pts.shape[0] == 1
+
+
+def test_sparse3d_can_preserve_first_frame_anchor_during_bootstrap():
+    K = get_dummy_camera()
+    bank = Sparse3DFilterBank(K, Sparse3DSettings(birth_min_flow_px=0.1, min_parallax_sin=0.001))
+    T0 = np.eye(4)
+    T1 = np.eye(4)
+    T1[0, 3] = 0.1
+    T2 = np.eye(4)
+    T2[0, 3] = 0.2
+
+    bank.update(0, {1: np.array([320.0, 240.0]), 2: np.array([340.0, 240.0])}, T0)
+    bank.update(1, {1: np.array([308.0, 240.0])}, T1, preserve_previous=True)
+
+    assert bank.prev_frame_id == 0
+    assert 2 in bank.prev_pixels
+
+    bank.update(2, {2: np.array([316.0, 240.0])}, T2, preserve_previous=True)
+
+    assert bank.prev_frame_id == 0
+    assert 2 in bank.features
+    assert bank.features[2].anchor_frame_id == 0
 
 
 def test_feature_tracker_tracks_stable_ids_under_translation():
@@ -882,6 +959,8 @@ def test_experimental_monocular_vo_post_bootstrap_guesses_use_direct_motion_mode
 
 
 def test_experimental_monocular_vo_keyframe_klt_pixel_guesses_track_map_landmarks():
+    # Map points keep their persistent KLT track; the association reads each map
+    # point's pixel from the tracker's observations (not a per-frame reprojection).
     K = get_dummy_camera()
     mono = ExperimentalMonocularVO(K, mono_map_config=MonoMapConfig(min_keyframe_landmarks=1))
     mono.bootstrap_complete = True
@@ -895,21 +974,12 @@ def test_experimental_monocular_vo_keyframe_klt_pixel_guesses_track_map_landmark
     T0 = np.eye(4)
     T1 = np.eye(4)
     T1[0, 3] = 0.05
-    img0 = np.zeros((480, 640), dtype=np.uint8)
-    img1 = np.zeros_like(img0)
-
-    for img, T in [(img0, T0), (img1, T1)]:
-        T_C_W = np.linalg.inv(T)
-        points_c = points @ T_C_W[:3, :3].T + T_C_W[:3, 3]
-        u = K[0, 0] * points_c[:, 0] / points_c[:, 2] + K[0, 2]
-        v = K[1, 1] * points_c[:, 1] / points_c[:, 2] + K[1, 2]
-        for ui, vi in zip(u, v):
-            cv2.circle(img, (int(round(ui)), int(round(vi))), 3, 255, -1)
+    img1 = np.zeros((480, 640), dtype=np.uint8)
 
     mono.T_W_C = T0.copy()
     mono.mono_map.add_keyframe(
         0,
-        img0,
+        img1,
         T0,
         0.0,
         0.0,
@@ -920,7 +990,11 @@ def test_experimental_monocular_vo_keyframe_klt_pixel_guesses_track_map_landmark
         len(points),
         len(points),
     )
-    mono.feature_tracker.prev_img = img0
+    # Persistent KLT tracks: previous frame at T0, current frame at T1.
+    obs0, _ = project_world_points(K, T0, points)
+    obs1, _ = project_world_points(K, T1, points)
+    mono.prev_observations = {int(i): obs0[i] for i in ids}
+    mono._current_observations = {int(i): obs1[i] for i in ids}
 
     refs = mono.mono_map.visible_references(T0, img1.shape)
     pixel_guesses = mono._keyframe_klt_pixel_guesses(img1, refs)
@@ -1014,6 +1088,48 @@ def test_experimental_monocular_vo_stops_after_good_keyframe_klt_candidate():
     assert len(calls) == 1
 
 
+def test_experimental_monocular_vo_rejects_direct_candidate_with_large_klt_residual():
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(K, mono_map_config=MonoMapConfig(min_keyframe_landmarks=1))
+    image = np.zeros((480, 640), dtype=np.uint8)
+    points = np.column_stack([
+        np.linspace(-0.4, 0.4, 60),
+        np.zeros(60),
+        np.ones(60) * 4.0,
+    ])
+    ids = np.arange(60)
+    mono.mono_map.add_keyframe(
+        0,
+        image,
+        np.eye(4),
+        0.0,
+        0.0,
+        ids,
+        points,
+        np.ones((60, 5), dtype=np.float32) * 100.0,
+        "first",
+        60,
+        60,
+    )
+    uv, _ = project_world_points(K, np.eye(4), points)
+    mono.last_keyframe_klt_points_w = points
+    mono.last_keyframe_klt_prev_pixels = uv
+    mono.last_keyframe_klt_pixels = uv + np.array([0.0, 8.0])
+    mono.candidate_klt_residual_gate_tracks = 10
+    mono.min_direct_landmarks = 10
+    mono.min_direct_inliers = 10
+
+    def fake_track(_image, _pts, _ints, _a_ref, _b_ref, T_C_W_guess, _a, _b, max_iters=10):
+        return T_C_W_guess, np.ones(len(_pts), dtype=bool), 0.0, 0.0
+
+    mono.direct_tracker.track_map = fake_track
+
+    result = mono._track_direct_candidates(image, [("direct_motion", np.eye(4))])
+
+    assert not result["accepted"]
+    assert result["candidates"][0]["reject_reason"] == "high_klt_reprojection_residual"
+
+
 def test_experimental_monocular_vo_projects_existing_map_landmarks_for_gftt_mask():
     K = get_dummy_camera()
     mono = ExperimentalMonocularVO(K, mono_map_config=MonoMapConfig(min_keyframe_landmarks=1))
@@ -1100,6 +1216,8 @@ def test_experimental_monocular_vo_retires_ekf_landmarks_after_keyframe_promotio
     )
     mono.feature_tracker.prev_points = np.array([[320.0, 240.0]], dtype=np.float32)
     mono.feature_tracker.ids = np.array([10], dtype=int)
+    mono.T_W_C = np.eye(4)
+    mono.T_W_C[0, 3] = 1.0  # give the landmark real anchor->current parallax
     image = np.zeros((480, 640), dtype=np.uint8)
     image[239:242, 319:322] = 100
 
@@ -1115,19 +1233,60 @@ def test_experimental_monocular_vo_retires_ekf_landmarks_after_keyframe_promotio
     assert 10 in mono.mono_map.keyframes[0].landmark_ids
     assert 10 not in mono.sparse3d.features
     assert 10 in mono.sparse3d.retired_ids
-    assert 10 not in mono.feature_tracker.ids
+    # The EKF depth filter is retired, but the KLT track is KEPT so the map point
+    # stays tracked by the front-end (covisibility/tracking).
+    assert 10 in mono.feature_tracker.ids
 
 
-def test_experimental_monocular_vo_throttles_ba_on_keyframe_insertions():
+def test_experimental_monocular_vo_first_keyframe_can_use_provisional_sparse_landmarks():
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(
+        K,
+        sparse_settings=Sparse3DSettings(min_track_length=3, conv_depth_variance=0.01),
+        mono_map_config=MonoMapConfig(min_keyframe_landmarks=1),
+    )
+    mono.bootstrap_complete = True
+    image = np.zeros((480, 640), dtype=np.uint8)
+    image[239:242, 319:322] = 120
+    lm = LandmarkFilter.from_anchor_pixel(
+        10,
+        0,
+        np.array([320.0, 240.0]),
+        K,
+        initial_depth=4.0,
+        depth_sigma=2.0,
+        anchor_T_W_C=np.eye(4),
+    )
+    lm.update(1, np.array([321.0, 240.0]), np.eye(4), K, np.eye(2) * 0.25)
+    mono.sparse3d.features[10] = lm
+    mono.T_W_C = np.eye(4)
+    mono.T_W_C[0, 3] = 1.0  # give the landmark real anchor->current parallax
+
+    mono._maybe_add_keyframe(
+        1,
+        image,
+        {10: np.array([320.0, 240.0])},
+        used_direct=True,
+        direct_inliers=mono.min_direct_inliers,
+        direct_landmarks=mono.min_direct_landmarks,
+    )
+
+    assert len(mono.mono_map.keyframes) == 1
+    assert 10 in mono.mono_map.keyframes[0].landmark_ids
+
+
+def test_experimental_monocular_vo_runs_joint_ba_on_keyframe_insertion():
+    # Phase 3A: a single joint BA runs on each keyframe insertion (the old
+    # every-N-keyframes throttle over three separate BAs is gone).
     K = get_dummy_camera()
     mono = ExperimentalMonocularVO(
         K,
         sparse_settings=Sparse3DSettings(min_track_length=0, conv_depth_variance=100.0),
         mono_map_config=MonoMapConfig(min_keyframe_landmarks=1),
-        ba_every_keyframes=2,
     )
     mono.bootstrap_complete = True
     mono.min_direct_landmarks = 1
+    mono.map_promotion_min_parallax_deg = 1.0
     mono.mono_map.add_keyframe(
         0,
         np.zeros((480, 640), dtype=np.uint8),
@@ -1152,35 +1311,22 @@ def test_experimental_monocular_vo_throttles_ba_on_keyframe_insertions():
             anchor_T_W_C=np.eye(4),
         )
 
-    calls = {"geo": 0, "photo": 0}
+    calls = {"joint": 0}
 
-    def fake_geo(_keyframes, max_iters=0):
-        calls["geo"] += 1
-        return {"ran": True, "window": len(_keyframes), "edges": 10}
+    def fake_joint(_window, **kwargs):
+        calls["joint"] += 1
+        return {"ran": True, "window": 2, "points": 2, "edges": 4, "cost_before": 1.0, "cost_after": 0.5}
 
-    def fake_photo(_keyframes, max_iters=0):
-        calls["photo"] += 1
-        return {"ran": True, "window": len(_keyframes), "residuals": 10}
-
-    mono.ba.optimize_mono_geometric_pose_window = fake_geo
-    mono.ba.optimize_mono_pose_window = fake_photo
+    mono.ba.optimize_mono_joint_window = fake_joint
 
     image = np.zeros((480, 640), dtype=np.uint8)
     mono.T_W_C[0, 3] = 1.0
-    mono._maybe_add_keyframe(1, image, {10: np.array([330.0, 240.0])}, True, 10, 10)
-    mono.sparse3d.features[11] = LandmarkFilter.from_anchor_pixel(
-        11,
-        0,
-        np.array([331.0, 240.0]),
-        K,
-        initial_depth=4.0,
-        depth_sigma=1.0,
-        anchor_T_W_C=np.eye(4),
-    )
-    mono.T_W_C[0, 3] = 2.0
-    mono._maybe_add_keyframe(2, image, {11: np.array([331.0, 240.0])}, True, 10, 10)
+    # frame 5 clears the min-frames-between-keyframes guard; with no tracked map
+    # points supplied, the scale-invariant rule inserts on "low_tracked".
+    mono._maybe_add_keyframe(5, image, {10: np.array([330.0, 240.0])}, True, 10, 10)
 
-    assert calls == {"geo": 1, "photo": 1}
+    assert len(mono.mono_map) == 2   # a second keyframe was inserted
+    assert calls["joint"] == 1       # joint BA runs on that insertion
 
 
 def test_mono_map_inserts_and_culls_keyframes():
@@ -1530,6 +1676,33 @@ def test_mono_map_syncs_landmark_tracks_after_keyframe_point_updates():
     assert np.allclose(mono_map.keyframes[0].features[10].point_w, refined)
 
 
+def test_mono_map_update_landmark_point_syncs_all_references():
+    K = get_dummy_camera()
+    mono_map = MonoMap(K, MonoMapConfig(min_keyframe_landmarks=1))
+    image = np.zeros((480, 640), dtype=np.uint8)
+    mono_map.add_keyframe(
+        0,
+        image,
+        np.eye(4),
+        0.0,
+        0.0,
+        np.array([10]),
+        np.array([[0.0, 0.0, 5.0]]),
+        np.ones((1, 5), dtype=np.float32),
+        "first",
+        1,
+        1,
+        observations={10: np.array([320.0, 240.0])},
+    )
+    refined = np.array([0.0, 0.0, 4.0], dtype=np.float64)
+
+    assert mono_map.update_landmark_point(10, refined)
+    assert np.allclose(mono_map.keyframes[0].points_w[0], refined)
+    assert np.allclose(mono_map.keyframes[0].features[10].point_w, refined)
+    assert np.allclose(mono_map.keyframes[0].observations[10].point_w, refined)
+    assert np.allclose(mono_map.landmarks[10].point_w, refined)
+
+
 def test_monocular_patch_matcher_accepts_translated_patch_and_rejects_occlusion():
     K = get_dummy_camera()
     mono = ExperimentalMonocularVO(K, mono_map_config=MonoMapConfig(min_keyframe_landmarks=1))
@@ -1595,6 +1768,40 @@ def test_monocular_matched_observation_pose_guess_recovers_translation():
     assert np.linalg.norm(guess[:3, 3] - T1[:3, 3]) < 0.03
 
 
+def test_monocular_klt_landmark_update_refines_promoted_depth_along_host_ray():
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(K, mono_map_config=MonoMapConfig(min_keyframe_landmarks=1))
+    image = synthetic_texture_image()
+    old_point = np.array([[0.0, 0.0, 5.0]])
+    true_point = np.array([[0.0, 0.0, 4.0]])
+    mono.mono_map.add_keyframe(
+        0,
+        image,
+        np.eye(4),
+        0.0,
+        0.0,
+        np.array([10]),
+        old_point,
+        sample_pattern(image, np.array([[320.0, 240.0]])),
+        "first",
+        1,
+        1,
+        observations={10: np.array([320.0, 240.0])},
+    )
+    mono.T_W_C = np.eye(4)
+    mono.T_W_C[0, 3] = 0.1
+    observed, _ = project_world_points(K, mono.T_W_C, true_point)
+    refs = mono.mono_map.visible_references(mono.T_W_C, image.shape)
+    before = mono.mono_map.landmarks[10].point_w.copy()
+
+    mono._update_map_landmarks_from_klt(image.shape, refs, {10: observed[0]})
+
+    after = mono.mono_map.landmarks[10].point_w
+    assert mono.last_landmark_updates == 1
+    assert after[2] < before[2]
+    assert mono.last_landmark_reproj_after_px < mono.last_landmark_reproj_before_px
+
+
 def test_experimental_monocular_vo_post_bootstrap_does_not_call_klt_pnp_pose_hook():
     K = get_dummy_camera()
     mono = ExperimentalMonocularVO(K)
@@ -1621,6 +1828,135 @@ def test_experimental_monocular_vo_post_bootstrap_does_not_call_klt_pnp_pose_hoo
     result = mono.process(0, image)
 
     assert result.motion_source == "hold"
+
+
+def test_experimental_monocular_vo_does_not_bootstrap_without_parallax():
+    # Phase 1: a two-view bootstrap must not seed a map (or a scale) until there is
+    # real parallax. With no inter-frame motion it must hold and stay bootstrapping.
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(K, min_essential_tracks=12)
+    image = np.zeros((480, 640), dtype=np.uint8)
+    observations = {
+        i: np.array([200.0 + i * 8.0, 240.0 + (i % 5) * 6.0], dtype=np.float64)
+        for i in range(40)
+    }
+    mono.feature_tracker.update = lambda _image, exclusion_points=None: observations
+
+    mono.process(0, image)  # creates the anchor keyframe (KF0)
+    result = mono.process(1, image)  # identical observations -> zero parallax
+
+    assert result.motion_source == "hold"
+    assert result.bootstrap_active
+    assert not mono.bootstrap_complete
+    assert np.allclose(mono.T_W_C, np.eye(4))
+    assert len(mono.mono_map.keyframes) == 1
+    assert len(mono.mono_map.keyframes[0].landmark_ids) == 0
+
+
+def test_experimental_monocular_vo_two_view_bootstrap_seeds_scaled_map():
+    # Phase 1: with sufficient parallax the map is seeded in one two-view step and
+    # scale is fixed once (median triangulated depth normalized to 1.0).
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(K, min_essential_tracks=12, min_direct_landmarks=1000)
+    image = np.zeros((480, 640), dtype=np.uint8)
+    rng = np.random.default_rng(7)
+    points_w = np.column_stack([
+        rng.uniform(-1.5, 1.5, 60),
+        rng.uniform(-1.0, 1.0, 60),
+        rng.uniform(4.0, 8.0, 60),
+    ])
+
+    T_W_C0 = np.eye(4)
+    T_W_C1 = np.eye(4)
+    T_W_C1[0, 3] = 0.5  # camera translates +50 cm along x (strong parallax)
+
+    def project(T_W_C, p_w):
+        p_c = np.linalg.inv(T_W_C)[:3, :3] @ (p_w - T_W_C[:3, 3])
+        return np.array([K[0, 0] * p_c[0] / p_c[2] + K[0, 2], K[1, 1] * p_c[1] / p_c[2] + K[1, 2]])
+
+    obs0 = {i: project(T_W_C0, p) for i, p in enumerate(points_w)}
+    obs1 = {i: project(T_W_C1, p) for i, p in enumerate(points_w)}
+    frames = iter([obs0, obs1])
+    mono.feature_tracker.update = lambda _image, exclusion_points=None: next(frames)
+
+    mono.process(0, image)  # anchor keyframe
+    result = mono.process(1, image)  # sufficient parallax -> bootstrap
+
+    assert result.motion_source == "two_view_bootstrap"
+    assert not result.bootstrap_active
+    assert mono.bootstrap_complete
+    kf0 = mono.mono_map.keyframes[0]
+    assert len(kf0.landmark_ids) >= 12
+
+    # Scale fixed once: median anchor-frame depth is normalized to ~1.0.
+    assert np.isclose(np.median(kf0.points_w[:, 2]), 1.0, atol=0.05)
+    # Pose recovered with the normalized baseline (0.3 m / median depth 6 m ~= 0.05).
+    assert mono.T_W_C[0, 3] > 0.0
+    assert abs(mono.T_W_C[0, 3]) > abs(mono.T_W_C[1, 3])
+    assert abs(mono.T_W_C[0, 3]) > abs(mono.T_W_C[2, 3])
+
+
+def test_map_promotion_parallax_mask_keeps_high_parallax_only():
+    # Phase 3B: map promotion is gated on anchor->current parallax (one estimator,
+    # the filter's own depth), not on EKF convergence.
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(K)
+    mono.map_promotion_min_parallax_deg = 1.0
+    mono.T_W_C = np.eye(4)
+    mono.T_W_C[0, 3] = 0.5  # current camera 0.5 m along x
+
+    high = LandmarkFilter.from_anchor_pixel(
+        1, 0, np.array([320.0, 240.0]), K, initial_depth=1.0, depth_sigma=1.0, anchor_T_W_C=np.eye(4),
+    )
+    low_anchor = np.eye(4)
+    low_anchor[0, 3] = 0.49  # anchor ~= current -> negligible baseline
+    low = LandmarkFilter.from_anchor_pixel(
+        2, 0, np.array([320.0, 240.0]), K, initial_depth=1.0, depth_sigma=1.0, anchor_T_W_C=low_anchor,
+    )
+    mono.sparse3d.features[1] = high
+    mono.sparse3d.features[2] = low
+
+    points_w = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
+    keep = mono._map_promotion_parallax_mask(points_w, np.array([1, 2]))
+    assert bool(keep[0]) is True   # ~26.6 deg parallax
+    assert bool(keep[1]) is False  # <1 deg parallax
+
+
+def test_experimental_monocular_vo_does_not_finish_bootstrap_from_landmark_count_only():
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(K)
+    image = np.zeros((120, 160), dtype=np.uint8)
+    observations = {
+        i: np.array([20.0 + i, 30.0 + i * 0.5], dtype=np.float64)
+        for i in range(12)
+    }
+    mono.feature_tracker.update = lambda _image, exclusion_points=None: observations
+    mono._essential_pose_guess = lambda _observations: None
+    mono._image_motion_pose_guess = lambda _observations: mono.T_W_C.copy()
+    mono._track_direct_candidates = lambda _image, _guesses: {
+        "accepted": False,
+        "hypotheses": len(_guesses),
+        "landmarks": mono.min_direct_landmarks * 3,
+        "attempted": False,
+        "inliers": 0,
+        "T_W_C": mono.T_W_C.copy(),
+        "a": mono.current_a,
+        "b": mono.current_b,
+        "source": "hold",
+        "candidates": [],
+    }
+
+    result = mono.process(0, image)
+
+    assert result.bootstrap_active
+    assert not mono.bootstrap_complete
+
+
+def test_experimental_monocular_vo_requires_dense_initial_keyframe_before_bootstrap_complete():
+    K = get_dummy_camera()
+    mono = ExperimentalMonocularVO(K, mono_map_config=MonoMapConfig(min_keyframe_landmarks=1))
+
+    assert mono.initial_keyframe_min_landmarks == mono.min_direct_landmarks * 3
 
 
 def test_mono_map_stores_observation_graph_for_keyframes():
@@ -1974,3 +2310,47 @@ def test_mono_inverse_depth_ba_skips_occluded_target_edges():
     assert not result["ran"]
     assert result["edges"] == 0
     assert np.allclose(mono_map.keyframes[0].points_w, before)
+
+
+def test_mono_joint_ba_recovers_perturbed_pose_with_covisible_points():
+    # Phase 3A: joint BA over poses + covisible points recovers a perturbed keyframe
+    # pose using multi-view reprojection (points anchored by tight transferred priors).
+    K = get_dummy_camera()
+    mono_map = MonoMap(K, MonoMapConfig(min_keyframe_landmarks=1))
+    image = np.zeros((480, 640), dtype=np.uint8)
+    rng = np.random.default_rng(21)
+    points = np.column_stack([
+        rng.uniform(-0.8, 0.8, 60),
+        rng.uniform(-0.5, 0.5, 60),
+        rng.uniform(4.0, 7.0, 60),
+    ])
+    ids = np.arange(len(points))
+    intens = np.ones((len(points), 5), dtype=np.float32)
+    T0 = np.eye(4)
+    T1_true = np.eye(4)
+    T1_true[0, 3] = 0.15
+    T1_true[1, 3] = -0.04
+    obs0, _ = project_world_points(K, T0, points)
+    obs1, _ = project_world_points(K, T1_true, points)
+
+    # KF0 hosts the points; KF1 is inserted at a wrong pose and then gains covisible
+    # observations of the same points (the multi-view constraint).
+    mono_map.add_keyframe(0, image, T0, 0.0, 0.0, ids, points, intens, "first",
+                          len(points), len(points), observations={i: obs0[i] for i in ids})
+    T1_init = T1_true.copy()
+    T1_init[0, 3] -= 0.05
+    T1_init[1, 3] += 0.03
+    mono_map.add_keyframe(1, image, T1_init, 0.0, 0.0, np.array([999]),
+                          np.array([[0.0, 0.0, 5.0]]), np.ones((1, 5), dtype=np.float32), "motion", 1, 1)
+    mono_map.add_covisibility_observations(1, {int(i): obs1[i] for i in ids})
+    for i in ids:
+        mono_map.set_landmark_covariance(int(i), np.eye(3) * 1e-4)  # confident points
+
+    before = reprojection_rmse(K, mono_map.keyframes[1].T_W_C, points, {i: obs1[i] for i in ids})
+    result = PhotometricBA(K).optimize_mono_joint_window(mono_map, max_nfev=100)
+    after = reprojection_rmse(K, mono_map.keyframes[1].T_W_C, points, {i: obs1[i] for i in ids})
+
+    assert result["ran"]
+    assert result["points"] >= 30
+    assert after < before * 0.3
+    assert np.linalg.norm(mono_map.keyframes[1].T_W_C[:3, 3] - T1_true[:3, 3]) < 0.02
