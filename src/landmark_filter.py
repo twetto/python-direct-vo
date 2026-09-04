@@ -322,6 +322,9 @@ class Sparse3DFilterBank:
             if int(fid) not in self.retired_ids
         }
 
+        # Hoist per-frame constants out of the per-landmark loop.
+        T_C_W = np.linalg.inv(T_W_C)
+        meas_cov = np.eye(2) * self.settings.sigma_pixel * self.settings.sigma_pixel
         for fid, lm in list(self.features.items()):
             if fid not in curr:
                 if remove_missing:
@@ -338,7 +341,7 @@ class Sparse3DFilterBank:
                 continue
 
             self.missed_frames[fid] = 0
-            T_C_A = np.linalg.inv(T_W_C) @ lm.anchor_T_W_C
+            T_C_A = T_C_W @ lm.anchor_T_W_C
             if self.settings.range_walk_var > 0.0:
                 point_c = lm.current_position(T_C_A)
                 lm.apply_range_process_noise(T_C_A, self.settings.range_walk_var * float(point_c @ point_c))
@@ -347,7 +350,7 @@ class Sparse3DFilterBank:
                 curr[fid],
                 T_C_A,
                 self.K,
-                np.eye(2) * self.settings.sigma_pixel * self.settings.sigma_pixel,
+                meas_cov,
                 bias_rw_sigma=self.settings.bias_walk_sigma,
                 gate_chi2=self.settings.mahalanobis_gate_chi2,
             )
