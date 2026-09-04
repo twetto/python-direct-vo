@@ -844,6 +844,7 @@ class ExperimentalMonocularVO:
             require_converged=False,
         )
         keep = self._map_promotion_parallax_mask(pts_w, ids)
+        keep &= self._map_promotion_klt_agreement_mask(pts_w, ids, image.shape)
         pts_w, intensities, ids = pts_w[keep], intensities[keep], ids[keep]
         inserted = self.mono_map.add_keyframe(
             frame_id,
@@ -1464,6 +1465,26 @@ class ExperimentalMonocularVO:
                 reanchor[fid] = uv[i]
         if reanchor:
             self.feature_tracker.set_positions(reanchor)
+
+    def _map_promotion_klt_agreement_mask(self, points_w: np.ndarray, ids: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+        """Reject promotion candidates whose reprojection disagrees with the KLT track.
+
+        KLT gives the true feature location; if a filter landmark's triangulated point
+        reprojects far from it, its depth is wrong -- don't put it in the map. Gated by
+        the same tolerance PnP uses (`pnp_reproj_thresh`).
+        """
+        keep = np.ones(len(ids), dtype=bool)  # default keep; only KLT disagreement rejects
+        if len(ids) == 0:
+            return keep
+        obs = self._current_observations or {}
+        uv, _z, visible = self._project_points(self.T_W_C, points_w, image_shape)
+        for i, fid in enumerate(ids):
+            klt = obs.get(int(fid))
+            if klt is None or not visible[i]:
+                continue  # no KLT result (or not visible) -> nothing to disagree with here
+            if float(np.linalg.norm(uv[i] - np.asarray(klt, dtype=np.float64))) > self.pnp_reproj_thresh:
+                keep[i] = False
+        return keep
 
     def _pnp_from_klt(
         self,
